@@ -433,7 +433,13 @@ class ModelConfig:
             )
 
             if "Glm4MoeLiteForCausalLM" in self.hf_config.architectures:
-                self.scaling = 1
+                # GLM-4.7-Flash: standard attention scaling 1/sqrt(qk_head_dim).
+                # No rope_scaling / mscale correction needed.
+                # Must match HuggingFace Glm4MoeLiteAttention.scaling
+                # (= qk_head_dim**-0.5), NOT hardcoded to 1.
+                self.scaling = 1 / math.sqrt(
+                    self.qk_nope_head_dim + self.qk_rope_head_dim
+                )
                 self.hf_config.rope_scaling = None
             else:
                 # Handle rope scaling with yarn
