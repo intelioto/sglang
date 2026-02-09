@@ -16,6 +16,7 @@ import torch.distributed
 from torch.cuda import synchronize
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
@@ -45,7 +46,11 @@ _group_name_counter: dict[str, int] = {}
 def get_local_torch_device() -> torch.device:
     """Return the torch device for the current rank."""
 
-    return current_platform.get_local_torch_device()
+    return (
+        torch.device(f"cuda:{envs.LOCAL_RANK}")
+        if current_platform.is_cuda_alike()
+        else torch.device("mps")
+    )
 
 
 def _get_unique_name(name: str) -> str:
@@ -185,6 +190,8 @@ class GroupCoordinator:
         # TODO: fix it for other platforms
         self.device = get_local_torch_device()
 
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
         self.use_device_communicator = use_device_communicator
 
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
@@ -280,6 +287,9 @@ class GroupCoordinator:
 
     @contextmanager
     def graph_capture(self, graph_capture_context: GraphCaptureContext | None = None):
+        # Platform-aware graph capture
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
         if current_platform.is_cuda_alike():
             if graph_capture_context is None:
                 stream = torch.cuda.Stream()

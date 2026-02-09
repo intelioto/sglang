@@ -14,7 +14,7 @@ from typing import Any, cast
 import torch
 from tqdm import tqdm
 
-from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+from sglang.multimodal_gen.runtime.loader.component_loader import (
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
@@ -182,25 +182,12 @@ class ComposedPipelineBase(ABC):
             "boundary_ratio" in model_index
             and model_index["boundary_ratio"] is not None
         ):
-            has_transformer = (
-                "transformer" in model_index
-                or "transformer_2" in model_index
-                or "transformer" in self.required_config_modules
-                or "transformer_2" in self.required_config_modules
-            )
-            if has_transformer:
-                logger.info(
-                    "MoE pipeline detected. Adding transformer_2 to self.required_config_modules..."
-                )
-                if "transformer_2" not in self.required_config_modules:
-                    self.required_config_modules.append("transformer_2")
-            else:
-                logger.info(
-                    "Boundary ratio found in model_index.json without transformers; "
-                    "using it for pipeline config only."
-                )
             logger.info(
-                "Setting boundary ratio to %s",
+                "MoE pipeline detected. Adding transformer_2 to self.required_config_modules..."
+            )
+            self.required_config_modules.append("transformer_2")
+            logger.info(
+                "MoE pipeline detected. Setting boundary ratio to %s",
                 model_index["boundary_ratio"],
             )
             server_args.pipeline_config.dit_config.boundary_ratio = model_index[
@@ -248,7 +235,7 @@ class ComposedPipelineBase(ABC):
         required_modules = self.required_config_modules
         logger.info("Loading required components: %s", required_modules)
 
-        loaded_components = {}
+        components = {}
         for module_name, (
             transformers_or_diffusers,
             architecture,
@@ -266,7 +253,7 @@ class ComposedPipelineBase(ABC):
                 continue
             if loaded_modules is not None and module_name in loaded_modules:
                 logger.info("Using module %s already provided", module_name)
-                loaded_components[module_name] = loaded_modules[module_name]
+                components[module_name] = loaded_modules[module_name]
                 continue
 
             # we load the module from the extra config module map if it exists
@@ -288,8 +275,8 @@ class ComposedPipelineBase(ABC):
                 )
             else:
                 component_model_path = os.path.join(self.model_path, load_module_name)
-            module, memory_usage = PipelineComponentLoader.load_component(
-                component_name=load_module_name,
+            module, memory_usage = PipelineComponentLoader.load_module(
+                module_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
@@ -297,23 +284,20 @@ class ComposedPipelineBase(ABC):
 
             self.memory_usages[load_module_name] = memory_usage
 
-            if module_name in loaded_components:
+            if module_name in components:
                 logger.warning("Overwriting module %s", module_name)
-            loaded_components[module_name] = module
+            components[module_name] = module
 
         # Check if all required modules were loaded
         for module_name in required_modules:
-            if (
-                module_name not in loaded_components
-                or loaded_components[module_name] is None
-            ):
+            if module_name not in components or components[module_name] is None:
                 raise ValueError(
-                    f"Required module: {module_name} was not found in loaded modules: {list(loaded_components.keys())}"
+                    f"Required module key: {module_name} value: {components.get(module_name)} was not found in loaded modules {components.keys()}"
                 )
 
         logger.debug("Memory usage of loaded modules: %s", self.memory_usages)
 
-        return loaded_components
+        return components
 
     def add_stage(self, stage_name: str, stage: PipelineStage):
         assert self.modules is not None, "No modules are registered"
@@ -343,8 +327,10 @@ class ComposedPipelineBase(ABC):
                 "LoRA adapter is set, but not effective. Please make sure the LoRA weights are merged"
             )
 
+        batch.log(server_args=server_args)
+
         # Execute each stage
-        if not batch.is_warmup and not batch.suppress_logs:
+        if not batch.is_warmup:
             logger.info(
                 "Running pipeline stages: %s",
                 list(self._stage_name_mapping.keys()),

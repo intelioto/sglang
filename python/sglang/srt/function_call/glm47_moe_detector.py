@@ -215,8 +215,9 @@ class Glm47MoeDetector(BaseFormatDetector):
         if last_end < len(text):
             normal_text_parts.append(text[last_end:])
 
-        # Combine all normal text parts
+        # Combine all normal text parts and clean orphan </tool_call> tags
         normal_text = "".join(normal_text_parts).strip()
+        normal_text = normal_text.replace(self.eot_token, "").strip()
 
         # Parse tool calls
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
@@ -228,6 +229,8 @@ class Glm47MoeDetector(BaseFormatDetector):
                 if func_detail is None:
                     continue
                 func_name = func_detail.group(1) if func_detail.group(1) else ""
+                # Clean spurious XML tags from function name (e.g. "bash</arg_value>" -> "bash")
+                func_name = self._XML_TAG_CLEANUP_RE.sub("", func_name).strip()
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
                 arguments = {}
                 if func_args:
@@ -444,6 +447,11 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         return json_output
 
+    # Regex to strip spurious XML tag fragments from function names
+    _XML_TAG_CLEANUP_RE = re.compile(
+        r"</?(?:arg_key|arg_value|tool_call|/arg_key|/arg_value|/tool_call)>.*", re.DOTALL
+    )
+
     def _extract_match_groups(self, match: re.Match) -> tuple[str, str, str]:
         """Extract function name, arguments and end marker from regex match.
 
@@ -454,6 +462,8 @@ class Glm47MoeDetector(BaseFormatDetector):
             (func_name, func_args_raw, is_tool_end)
         """
         func_name = match.group(1).strip()
+        # Clean spurious XML tags from function name (e.g. "bash</arg_value>" -> "bash")
+        func_name = self._XML_TAG_CLEANUP_RE.sub("", func_name).strip()
         func_args_raw = match.group(2).strip() if match.group(2) else ""
         is_tool_end = match.group(3) or ""
         return func_name, func_args_raw, is_tool_end

@@ -320,9 +320,6 @@ class TokenIdsAndLogprobs:
     token_ids: List[int]
     logprobs: List[float]
 
-    # Logprob differences smaller than this are treated as non-divergent.
-    DIVERGENCE_EPS = 0.0
-
     def __add__(self, other):
         return TokenIdsAndLogprobs(
             token_ids=self.token_ids + other.token_ids,
@@ -346,19 +343,19 @@ class TokenIdsAndLogprobs:
             print(f"✅ Logprobs match:", a.logprobs[:5])
         else:
             print(f"❌ Logprobs mismatch")
-            # Only print last 10 elements for readability
-            n_show = 10
-            a_show = a.logprobs[-n_show:]
-            b_show = b.logprobs[-n_show:]
+            # Only print first 5 elements for readability
+            n_show = 5
+            a_show = a.logprobs[:n_show]
+            b_show = b.logprobs[:n_show]
             print(
-                "    A:  ...  ",
+                "    A:   ",
                 [f"{x:.10f}" if x is not None else "None" for x in a_show],
-                f"({len(a.logprobs)} total)" if len(a.logprobs) > n_show else "",
+                f"... ({len(a.logprobs)} total)" if len(a.logprobs) > n_show else "",
             )
             print(
-                "    B:  ...  ",
+                "    B:   ",
                 [f"{x:.10f}" if x is not None else "None" for x in b_show],
-                f"({len(b.logprobs)} total)" if len(b.logprobs) > n_show else "",
+                f"... ({len(b.logprobs)} total)" if len(b.logprobs) > n_show else "",
             )
             diff = [
                 abs(x - y) if x is not None else float("nan")
@@ -366,7 +363,7 @@ class TokenIdsAndLogprobs:
             ]
             print(
                 "    Diff:",
-                [f"{x:.10e}" for x in diff[-n_show:]],
+                [f"{x:.10e}" for x in diff[:n_show]],
                 f"... ({len(diff)} total)" if len(diff) > n_show else "",
             )
 
@@ -384,24 +381,13 @@ class TokenIdsAndLogprobs:
 
                 # K3 approximation: KL(A||B) ≈ (exp(logr) - 1) - logr, where logr = log_a - log_b
                 logr = logprobs_a - logprobs_b
-                diverge_mask = np.abs(logr) > cls.DIVERGENCE_EPS
-                diverge_count = int(np.count_nonzero(diverge_mask))
-                total_count = int(logr.shape[0])
+                kl_per_token = (np.exp(logr) - 1) - logr
+                kl_mean = np.mean(kl_per_token)
+                kl_max = np.max(kl_per_token)
 
-                if diverge_count > 0:
-                    kl_per_token = (np.exp(logr) - 1) - logr
-                    kl_divergent = kl_per_token[diverge_mask]
-                    kl_mean = float(np.mean(kl_divergent))
-                    kl_max = float(np.max(kl_divergent))
-                    mean_abs_logr = float(np.mean(np.abs(logr[diverge_mask])))
-                    print(f"    Divergent tokens: {diverge_count}/{total_count}")
-                    print(f"    KL(A||B) mean (divergent): {kl_mean:.10e}")
-                    print(f"    KL(A||B) max  (divergent): {kl_max:.10e}")
-                    print(
-                        f"    Mean absolute logprob diff (divergent): {mean_abs_logr:.10e}"
-                    )
-                else:
-                    print(f"    Divergent tokens: 0/{total_count}")
+                print(f"    KL(A||B) mean: {kl_mean:.10e}")
+                print(f"    KL(A||B) max : {kl_max:.10e}")
+                print(f"    Mean absolute logprob diff: {np.mean(np.abs(logr)):.10e}")
 
         return token_match and logprobs_match
 
@@ -542,25 +528,23 @@ def test_deterministic(args):
         # Flush cache first to make sure there is no cache hit from previous tests
         flush_response = requests.post(f"http://{args.host}:{args.port}/flush_cache")
 
-        prefix_len = 100
-        print(f"Step 1: Generating random {prefix_len} token IDs...")
+        print(f"Step 1: Generating random 64 token IDs...")
         # Use a reasonable token ID range (e.g., 1-50000 for most tokenizers)
         # Avoid special tokens like 0 (padding), 1 (BOS), 2 (EOS)
         # set seed for random.randint
         random.seed(42)
-        initial_token_ids = [random.randint(100, 50000) for _ in range(prefix_len)]
+        initial_token_ids = [random.randint(100, 50000) for _ in range(64)]
 
         print(f"✓ Using {len(initial_token_ids)} initial tokens")
         print(f"  Initial token IDs: {initial_token_ids}")
 
-        num_tokens_to_generate = 2
         print(
-            f"\nStep 2: Generating {num_tokens_to_generate} tokens from {len(initial_token_ids)} token prefix..."
+            f"\nStep 2: Generating 2 tokens from {len(initial_token_ids)} token prefix..."
         )
         first_response = send_single(
             args,
             input_ids=initial_token_ids,
-            max_new_tokens=num_tokens_to_generate,
+            max_new_tokens=100,
             return_full_response=True,
         )
         first_output_text = first_response["text"]
@@ -574,11 +558,11 @@ def test_deterministic(args):
         print(f'  Output text: "{first_output_text}"')
 
         print(
-            f"\nStep 3: Generating with radix cache ({len(initial_token_ids + first_output_token_ids[:-1])} tokens prefill, should hit cache based on page size)..."
+            f"\nStep 3: Generating with radix cache (164 tokens prefill, should hit > 128 tokens cache, based on page size)..."
         )
         prefix_token_ids = initial_token_ids + first_output_token_ids[:-1]
         print(
-            f"  Prefix: {len(initial_token_ids)} initial + 1 generated = {len(prefix_token_ids)} tokens"
+            f"  Prefix: {len(initial_token_ids)} initial + 64 generated = {len(prefix_token_ids)} tokens"
         )
         print(f"Using Prompt: {prefix_token_ids}")
         cached_response = send_single(

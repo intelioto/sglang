@@ -109,8 +109,6 @@ class SchedulerMetricsMixin:
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
-            if self.server_args.extra_metric_labels:
-                labels.update(self.server_args.extra_metric_labels)
             self.metrics_collector = SchedulerMetricsCollector(
                 labels=labels,
                 enable_lora=self.enable_lora,
@@ -152,7 +150,6 @@ class SchedulerMetricsMixin:
         can_run_list: List[Req],
         running_bs: int,
         running_bs_offline_batch: int,
-        can_run_cuda_graph: bool,
     ):
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
@@ -207,7 +204,7 @@ class SchedulerMetricsMixin:
         self.stats.new_token_ratio = adder.new_token_ratio
         iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
 
-        msg = (
+        f = (
             f"Prefill batch{iter_msg}, "
             f"#new-seq: {len(can_run_list)}, "
             f"#new-token: {adder.log_input_tokens}, "
@@ -218,23 +215,11 @@ class SchedulerMetricsMixin:
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
-            msg += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
-            msg += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
-        else:
-            msg += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+            f += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
+            f += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
-        graph_backend = defaultdict(
-            lambda: "cuda graph",
-            {
-                "cpu": "cpu graph",
-                "npu": "npu graph",
-            },
-        )
-
-        msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}"
-
-        logger.info(msg)
+        logger.info(f)
 
         if self.enable_metrics:
             # Basics
@@ -398,17 +383,10 @@ class SchedulerMetricsMixin:
             msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
-        graph_backend = defaultdict(
-            lambda: "cuda graph",
-            {
-                "cpu": "cpu graph",
-                "npu": "npu graph",
-            },
-        )
         msg += (
-            f"{graph_backend[self.device]}: {can_run_cuda_graph}, "
+            f"{'cuda graph' if self.device == 'cuda' else 'cpu graph'}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}"
+            f"#queue-req: {len(self.waiting_queue)}, "
         )
 
         logger.info(msg)

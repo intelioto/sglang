@@ -1,8 +1,6 @@
 #pragma once
 #include <sgl_kernel/type.cuh>
 
-#include <cmath>
-
 namespace device::math {
 
 inline constexpr float log2e = 1.44269504088896340736f;
@@ -33,18 +31,6 @@ SGL_DEVICE T sqrt(T a) {
 template <typename T>
 SGL_DEVICE T rsqrt(T a) {
   return dtype_trait<T>::rsqrt(a);
-}
-
-SGL_DEVICE float exp(float a) {
-  return ::expf(a);
-}
-
-SGL_DEVICE float sin(float a) {
-  return ::sinf(a);
-}
-
-SGL_DEVICE float cos(float a) {
-  return ::cosf(a);
 }
 
 }  // namespace device::math

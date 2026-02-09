@@ -7,7 +7,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    is_musa,
     is_npu,
     is_xpu,
 )
@@ -18,7 +17,6 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-_is_musa = is_musa()
 
 
 class MultiPlatformOp(nn.Module):
@@ -85,12 +83,6 @@ class MultiPlatformOp(nn.Module):
     def forward_xpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
-    def forward_musa(self, *args, **kwargs):
-        # XXX (MUSA): MUSA kernels follow the CUDA path by default.
-        # At this stage, sgl-kernel support for MUSA is still under active
-        # development, so we fall back to the PyTorch-native implementation.
-        return self.forward_native(*args, **kwargs)
-
     def forward_hpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
@@ -108,7 +100,5 @@ class MultiPlatformOp(nn.Module):
             return self.forward_npu
         elif _is_xpu:
             return self.forward_xpu
-        elif _is_musa:
-            return self.forward_musa
         else:
             return self.forward_native

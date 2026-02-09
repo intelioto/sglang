@@ -52,7 +52,6 @@ if TYPE_CHECKING:
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fp8": Fp8Config,
-    "mxfp8": Fp8Config,
     "blockwise_int8": BlockInt8Config,
     "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8
     "modelopt_fp8": ModelOptFp8Config,

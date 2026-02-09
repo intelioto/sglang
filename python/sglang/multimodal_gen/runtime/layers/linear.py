@@ -6,13 +6,13 @@
 from abc import abstractmethod
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
-    get_tp_group,
+    get_tp_rank,
+    get_tp_world_size,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -21,7 +21,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
 
 # yapf: disable
 from sglang.multimodal_gen.runtime.models.parameter import (
@@ -35,7 +34,6 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 
 # yapf: enable
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -153,7 +151,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         output = (
             F.linear(x, layer.weight, bias)
-            if current_platform.is_amp_supported() or bias is None
+            if torch.cuda.is_available() or bias is None
             else F.linear(x, layer.weight, bias.to(x.dtype))
         )  # NOTE: this line assumes that we are using amp when using cuda and is needed to account for the fact that amp isn't supported in mps
         return output
@@ -323,12 +321,9 @@ class ColumnParallelLinear(LinearBase):
         quant_config: QuantizationConfig | None = None,
         output_sizes: list[int] | None = None,
         prefix: str = "",
-        tp_group: dist.ProcessGroup = None,
     ):
         # Divide the weight matrix along the last dimension.
-        self.tp_group = tp_group or get_tp_group()
-        self.tp_size = get_group_size(self.tp_group)
-        self.tp_rank = get_group_rank(self.tp_group)
+        self.tp_size = get_tp_world_size()
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
@@ -379,7 +374,7 @@ class ColumnParallelLinear(LinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor) -> None:
-        tp_rank = self.tp_rank
+        tp_rank = get_tp_rank()
         output_dim = getattr(param, "output_dim", None)
 
         is_sharded_weight = getattr(param, "is_sharded_weight", False)
@@ -415,9 +410,7 @@ class ColumnParallelLinear(LinearBase):
         output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
-            output = tensor_model_parallel_all_gather(
-                output_parallel, tp_group=self.tp_group
-            )
+            output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
@@ -427,7 +420,7 @@ class ColumnParallelLinear(LinearBase):
         s = f"in_features={self.input_size}"
         s += f", output_features={self.output_size_per_partition}"
         s += f", bias={self.bias is not None}"
-        s += f", tp_size={self.tp_size}"
+        s += f", tp_size={get_tp_world_size()}"
         s += f", gather_output={self.gather_output}"
         return s
 
@@ -465,8 +458,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         params_dtype: torch.dtype | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        tp_group: dist.ProcessGroup = None,
     ):
+        self.output_sizes = output_sizes
+        tp_size = get_tp_world_size()
+        assert all(output_size % tp_size == 0 for output_size in output_sizes)
         super().__init__(
             input_size=input_size,
             output_size=sum(output_sizes),
@@ -476,10 +471,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
-            tp_group=tp_group,
         )
-        self.output_sizes = output_sizes
-        assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
 
     def weight_loader(
         self,
@@ -520,8 +512,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             return
 
         assert loaded_shard_id < len(self.output_sizes)
-        tp_rank = self.tp_rank
-        tp_size = self.tp_size
+        tp_rank = get_tp_rank()
+        tp_size = get_tp_world_size()
         if output_dim is not None:
             shard_offset = sum(self.output_sizes[:loaded_shard_id]) // tp_size
             shard_size = self.output_sizes[loaded_shard_id] // tp_size
@@ -615,7 +607,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         assert loaded_shard_id < len(self.output_sizes)
 
-        tp_size = self.tp_size
+        tp_size = get_tp_world_size()
 
         if isinstance(param, BlockQuantScaleParameter):
             raise NotImplementedError("FP8 is not implemented yet")
@@ -682,7 +674,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         params_dtype: torch.dtype | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        tp_group: dist.ProcessGroup = None,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -691,8 +682,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
-        tp_group = tp_group or get_tp_group()
-        tp_size = get_group_size(tp_group)
+        tp_size = get_tp_world_size()
         self.num_heads = divide(self.total_num_heads, tp_size)
         if tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
@@ -719,7 +709,6 @@ class QKVParallelLinear(ColumnParallelLinear):
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
-            tp_group=tp_group,
         )
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str) -> int | None:
@@ -863,7 +852,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 self.weight_loader(param, loaded_weight_shard, shard_id)
             return
 
-        tp_rank = self.tp_rank
+        tp_rank = get_tp_rank()
         assert loaded_shard_id in ["q", "k", "v"]
 
         # If output dim is defined, use the default loading process.
@@ -955,12 +944,10 @@ class RowParallelLinear(LinearBase):
         reduce_results: bool = True,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        tp_group: dist.ProcessGroup = None,
     ):
         # Divide the weight matrix along the first dimension.
-        self.tp_group = tp_group or get_tp_group()
-        self.tp_rank = get_group_rank(self.tp_group)
-        self.tp_size = get_group_size(self.tp_group)
+        self.tp_rank = get_tp_rank()
+        self.tp_size = get_tp_world_size()
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -1005,7 +992,7 @@ class RowParallelLinear(LinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        tp_rank = self.tp_rank
+        tp_rank = get_tp_rank()
         input_dim = getattr(param, "input_dim", None)
         is_sharded_weight = getattr(param, "is_sharded_weight", False)
         # bitsandbytes loads the weights of the specific portion
@@ -1040,7 +1027,7 @@ class RowParallelLinear(LinearBase):
         if self.input_is_parallel:
             input_parallel = input_
         else:
-            tp_rank = self.tp_rank
+            tp_rank = get_tp_rank()
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.tp_size
             )
@@ -1053,9 +1040,7 @@ class RowParallelLinear(LinearBase):
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
         if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(
-                output_parallel, tp_group=self.tp_group
-            )
+            output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 

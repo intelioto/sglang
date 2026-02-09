@@ -29,10 +29,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_WHITELISTED_HEADERS = ["x-smg-routing-key"]
-WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
-    h.lower() for h in envs.SGLANG_LOG_REQUEST_HEADERS.get()
-]
+WHITELISTED_HEADERS = ["x-smg-routing-key"]
 
 
 def _extract_whitelisted_headers(
@@ -120,14 +117,7 @@ class RequestLogger:
             and obj.input_ids is not None
             and tokenizer is not None
         ):
-            if obj.input_ids and isinstance(obj.input_ids[0], list):
-                # Prefill node warmup while PD disaggregated.
-                decoded = [
-                    tokenizer.decode(_input_ids, skip_special_tokens=False)
-                    for _input_ids in obj.input_ids
-                ]
-            else:
-                decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
+            decoded = tokenizer.decode(obj.input_ids, skip_special_tokens=False)
             obj.text = decoded
 
     def log_finished_request(

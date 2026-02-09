@@ -394,7 +394,7 @@ class FalconH1Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
-            use_attn_tp_group=is_dp_attention_enabled(),
+            enable_tp=not is_dp_attention_enabled(),
         )
 
         def get_layer(idx: int, prefix: str):

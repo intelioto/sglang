@@ -297,10 +297,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.register_mapping(weakref.proxy(self.full_to_swa_index_mapping))
 
     def available_size(self):
-        return min(
-            self.full_attn_allocator.available_size(),
-            self.swa_attn_allocator.available_size(),
-        )
+        # Note: use full_available_size() and swa_available_size() instead.
+        raise NotImplementedError()
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()

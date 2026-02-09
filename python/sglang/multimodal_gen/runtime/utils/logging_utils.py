@@ -68,7 +68,21 @@ DEFAULT_LOGGING_CONFIG = {
 }
 
 
-class ColoredFormatter(logging.Formatter):
+class NewLineFormatter(logging.Formatter):
+    """Adds logging prefix to newlines to align multi-line messages."""
+
+    def __init__(self, fmt, datefmt=None, style="%"):
+        logging.Formatter.__init__(self, fmt, datefmt, style)
+
+    def format(self, record):
+        msg = logging.Formatter.format(self, record)
+        if record.message != "":
+            parts = msg.split(record.message)
+            msg = msg.replace("\n", "\r\n" + parts[0])
+        return msg
+
+
+class ColoredFormatter(NewLineFormatter):
     """A logging formatter that adds color to log levels."""
 
     LEVEL_COLORS = {
@@ -77,13 +91,16 @@ class ColoredFormatter(logging.Formatter):
     }
 
     def format(self, record: logging.LogRecord) -> str:
-        """Adds color to the log"""
+        """Adds color to the log level name."""
+        original_levelname = record.levelname
+        color = self.LEVEL_COLORS.get(record.levelno)
+        if color:
+            record.levelname = f"{color}{original_levelname}{RESET}"
 
         formatted_message = super().format(record)
 
-        color = self.LEVEL_COLORS.get(record.levelno)
         if color:
-            formatted_message = f"{color}{formatted_message}{RESET}"
+            record.levelname = original_levelname
 
         return formatted_message
 
@@ -125,7 +142,6 @@ def get_is_local_main_process():
 
 
 def _log_process_aware(
-    server_log_level: int,
     level: int,
     logger_self: Logger,
     msg: object,
@@ -137,12 +153,12 @@ def _log_process_aware(
     """Helper function to log a message if the process rank matches the criteria."""
     is_main_process = get_is_main_process()
     is_local_main_process = get_is_local_main_process()
+
     should_log = (
         not main_process_only
         and not local_main_process_only
         or (main_process_only and is_main_process)
         or (local_main_process_only and is_local_main_process)
-        or server_log_level <= logging.DEBUG
     )
 
     if should_log:
@@ -218,8 +234,6 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
 
     logger = logging.getLogger(name)
 
-    server_log_level = logger.getEffectiveLevel()
-
     # Patch instance methods
     setattr(logger, "info_once", MethodType(_print_info_once, logger))
     setattr(logger, "warning_once", MethodType(_print_warning_once, logger))
@@ -238,7 +252,6 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
             **kwargs: Any,
         ) -> None:
             _log_process_aware(
-                server_log_level,
                 level,
                 self,
                 msg,
@@ -268,7 +281,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
     setattr(
         logger,
         "error",
-        MethodType(_create_patched_method(logging.ERROR, False, False), logger),
+        MethodType(_create_patched_method(logging.ERROR, False, True), logger),
     )
 
     return cast(_SGLDiffusionLogger, logger)
@@ -359,15 +372,12 @@ def set_uvicorn_logging_configs():
 def configure_logger(server_args, prefix: str = ""):
     log_format = f"[%(asctime)s{prefix}] %(message)s"
     datefmt = "%m-%d %H:%M:%S"
-
-    formatter = ColoredFormatter(log_format, datefmt=datefmt)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(formatter)
-
-    root = logging.getLogger()
-    root.handlers.clear()
-    root.addHandler(handler)
-    root.setLevel(getattr(logging, server_args.log_level.upper()))
+    logging.basicConfig(
+        level=getattr(logging, server_args.log_level.upper()),
+        format=log_format,
+        datefmt=datefmt,
+        force=True,
+    )
 
     set_uvicorn_logging_configs()
 

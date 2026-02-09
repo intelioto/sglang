@@ -196,7 +196,7 @@ class SchedulerProfilerMixin:
                     None
                     if not _is_npu
                     else torch_npu.profiler.tensorboard_trace_handler(
-                        str(self.torch_profiler_output_dir)
+                        self.torch_profiler_output_dir
                     )
                 ),
             )

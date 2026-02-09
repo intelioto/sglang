@@ -18,7 +18,6 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
-    get_moe_a2a_backend,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
@@ -44,6 +43,7 @@ from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
     is_layer_skipped,
     per_tensor_dequantize,
+    prepare_static_weights_for_trtllm_fp4_moe,
     requantize_with_max_scale,
     swizzle_blockscale,
 )
@@ -64,17 +64,17 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.models.utils import WeightsMapper
 
-fp4_quantize = None
 try:
     if is_sm120_supported():
-        try:
-            from flashinfer import fp4_quantize
-        except ImportError:
-            from sgl_kernel import scaled_fp4_quant as fp4_quantize
+        # PATCH: FlashInfer mm_fp4 CUTLASS backend produces incorrect results
+        # on SM120 (Blackwell desktop GPUs, e.g. RTX PRO 6000).
+        # cuDNN also fails (CUDNN_STATUS_BAD_PARAM), TRTLLM unsupported on SM120.
+        # Force sgl_kernel path which works correctly on SM120.
+        from sgl_kernel import scaled_fp4_quant as fp4_quantize
     else:
         from sgl_kernel import scaled_fp4_quant as fp4_quantize
+
 except ImportError:
     fp4_quantize = None
 
@@ -82,7 +82,17 @@ try:
     from flashinfer import mm_fp4 as flashinfer_fp4_gemm
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
-    enable_flashinfer_fp4_gemm = True
+    if is_sm120_supported():
+        # PATCH: Force sgl_kernel CUTLASS for FP4 GEMM on SM120.
+        # FlashInfer mm_fp4 cutlass backend broken on SM120 Blackwell.
+        if is_cuda():
+            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+        enable_flashinfer_fp4_gemm = False
+        reorder_rows_for_gated_act_gemm = None
+        shuffle_matrix_a = None
+        shuffle_matrix_sf_a = None
+    else:
+        enable_flashinfer_fp4_gemm = True
 except ImportError:
     if is_cuda():
         from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
@@ -139,6 +149,9 @@ def fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
     else:
+        logger.info_once(
+            "PATCH: Using sgl_kernel.cutlass_scaled_fp4_mm for FP4 dense GEMM (SM120 workaround)"
+        )
         return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
 
 
@@ -154,103 +167,6 @@ if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
-
-# FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
-FP4_GEMM_ALIGNMENT = 32
-
-
-def round_up_to_multiple(x: int, m: int) -> int:
-    """Round up x to the nearest multiple of m."""
-    return (x + m - 1) // m * m
-
-
-def pad_nvfp4_weight(
-    weight: torch.Tensor,
-    n_alignment: int = FP4_GEMM_ALIGNMENT,
-    k_alignment: int = FP4_GEMM_ALIGNMENT,
-) -> tuple[torch.Tensor, int]:
-    """
-    Pad packed NVFP4 weights to satisfy alignment constraints for FP4 GEMM kernels.
-
-    Different backends have different alignment requirements:
-    - CUTLASS/cuDNN: N % 32 == 0, K % 32 == 0
-    - TRTLLM: N % 128 == 0 (for shuffle_matrix_sf_a), K padding handled separately
-
-    Args:
-        weight: Packed FP4 weight tensor of shape [N, K//2] (2 FP4 values per byte)
-        n_alignment: Required alignment for N dimension (default 32, use 128 for TRTLLM)
-        k_alignment: Required alignment for K dimension (default 32, use 0 to skip)
-
-    Returns:
-        Tuple of (padded_weight, weights_padding_cols) where weights_padding_cols
-        is the number of columns added for K-dimension padding (in bytes).
-    """
-    weight_current_rows = weight.shape[0]  # N dimension
-    weight_current_col_bytes = weight.shape[1]  # K//2 (packed)
-
-    # Calculate padding for N dimension (rows)
-    pad_rows = 0
-    if n_alignment > 0 and weight_current_rows % n_alignment != 0:
-        total_rows = round_up_to_multiple(weight_current_rows, n_alignment)
-        pad_rows = total_rows - weight_current_rows
-
-    # Calculate padding for K dimension (columns)
-    # 2 FP4 items are packed per byte in the input dimension
-    weight_current_col_elements = weight_current_col_bytes * 2
-    pad_cols_bytes = 0
-    if k_alignment > 0 and weight_current_col_elements % k_alignment != 0:
-        total_cols = round_up_to_multiple(weight_current_col_elements, k_alignment)
-        pad_cols = total_cols - weight_current_col_elements
-        # pad_cols is in elements, but padding is in bytes (2 elements per byte)
-        pad_cols_bytes = pad_cols // 2
-
-    # Apply padding in a single operation if needed
-    # For 2D tensor, pad argument is (pad_left, pad_right, pad_top, pad_bottom)
-    if pad_rows > 0 or pad_cols_bytes > 0:
-        weight = torch.nn.functional.pad(
-            weight, (0, pad_cols_bytes, 0, pad_rows)
-        ).contiguous()
-
-    return weight, pad_cols_bytes
-
-
-def pad_nvfp4_activation_for_cutlass(
-    x_fp4: torch.Tensor,
-    weights_padding_cols: int,
-) -> torch.Tensor:
-    """
-    Pad packed FP4 activations to match the K-dimension padding applied to weights.
-
-    Args:
-        x_fp4: Packed FP4 activation tensor
-        weights_padding_cols: Number of padding columns (in bytes) from weight padding
-
-    Returns:
-        Padded activation tensor
-    """
-    if weights_padding_cols > 0:
-        return torch.nn.functional.pad(x_fp4, (0, weights_padding_cols)).contiguous()
-    return x_fp4
-
-
-def slice_nvfp4_output(
-    out: torch.Tensor,
-    output_size: int,
-) -> torch.Tensor:
-    """
-    Slice the output tensor to remove padding in N dimension if weight was padded.
-
-    Args:
-        out: Output tensor from FP4 GEMM
-        output_size: Original output size before padding
-
-    Returns:
-        Sliced output tensor with padding removed
-    """
-    if out.shape[-1] != output_size:
-        return out[..., :output_size].contiguous()
-    return out
-
 
 # TODO make it true by default when the DeepEP PR is merged
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
@@ -304,22 +220,6 @@ class ModelOptQuantConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
-
-    def apply_weight_name_mapper(
-        self, hf_to_sglang_mapper: "WeightsMapper"
-    ):  # noqa: B027
-        # Map excluded module patterns from HF layout to sglang layout.
-        # Ref: HF hf_quant_config.json for nvidia/Kimi-K2.5-NVFP4
-        # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/hf_quant_config.json
-        if self.exclude_modules:
-            mapped = hf_to_sglang_mapper.apply_list(self.exclude_modules)
-            expanded: List[str] = []
-            for name in mapped:
-                expanded.append(name)
-                if name.startswith("language_model."):
-                    expanded.append(name.removeprefix("language_model."))
-            # Preserve order, drop duplicates.
-            self.exclude_modules = list(dict.fromkeys(expanded))
 
 
 class ModelOptFp8Config(ModelOptQuantConfig):
@@ -709,12 +609,81 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
         # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
         if get_moe_runner_backend().is_flashinfer_trtllm():
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                align_fp8_moe_weights_for_flashinfer_trtllm,
+            from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
+
+            # 1) Swap W13 halves: [Up, Gate] -> [Gate, Up] expected by FI
+            num_experts, two_n, hidden = layer.w13_weight.shape
+            inter = two_n // 2
+            w13_swapped = (
+                layer.w13_weight.reshape(num_experts, 2, inter, hidden)
+                .flip(dims=[1])
+                .reshape(num_experts, two_n, hidden)
             )
 
-            # ModelOpt FP8 stores weights in [Up, Gate] order, so we need to swap
-            align_fp8_moe_weights_for_flashinfer_trtllm(layer, swap_w13_halves=True)
+            # 2) Reorder rows for fused gated activation (W13)
+            w13_interleaved = [
+                reorder_rows_for_gated_act_gemm(w13_swapped[i])
+                for i in range(num_experts)
+            ]
+            w13_interleaved = torch.stack(w13_interleaved).reshape(
+                num_experts, two_n, hidden
+            )
+
+            # 3) Shuffle weights for transposed MMA output (both W13, W2)
+            epilogue_tile_m = 128
+            w13_shuffled = [
+                shuffle_matrix_a(w13_interleaved[i].view(torch.uint8), epilogue_tile_m)
+                for i in range(num_experts)
+            ]
+            w2_shuffled = [
+                shuffle_matrix_a(layer.w2_weight[i].view(torch.uint8), epilogue_tile_m)
+                for i in range(num_experts)
+            ]
+
+            layer.w13_weight = Parameter(
+                torch.stack(w13_shuffled).view(torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            layer.w2_weight = Parameter(
+                torch.stack(w2_shuffled).view(torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+
+        # Precompute and register per-expert output scaling factors for FI MoE
+        if get_moe_runner_backend().is_flashinfer_trtllm():
+            # Note: w13_input_scale and w2_input_scale are scalar Parameters post-reduction
+            assert (
+                hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
+            )
+            assert hasattr(layer, "w2_input_scale") and layer.w2_input_scale is not None
+            assert (
+                hasattr(layer, "w13_weight_scale")
+                and layer.w13_weight_scale is not None
+            )
+            assert (
+                hasattr(layer, "w2_weight_scale") and layer.w2_weight_scale is not None
+            )
+
+            input_scale = layer.w13_input_scale.to(torch.float32)
+            activation_scale = layer.w2_input_scale.to(torch.float32)
+            w13_weight_scale = layer.w13_weight_scale.to(torch.float32)
+            w2_weight_scale = layer.w2_weight_scale.to(torch.float32)
+
+            output1_scales_scalar = (
+                w13_weight_scale * input_scale * (1.0 / activation_scale)
+            )
+            output1_scales_gate_scalar = w13_weight_scale * input_scale
+            output2_scales_scalar = activation_scale * w2_weight_scale
+
+            layer.output1_scales_scalar = Parameter(
+                output1_scales_scalar, requires_grad=False
+            )
+            layer.output1_scales_gate_scalar = Parameter(
+                output1_scales_gate_scalar, requires_grad=False
+            )
+            layer.output2_scales_scalar = Parameter(
+                output2_scales_scalar, requires_grad=False
+            )
         elif get_moe_runner_backend().is_flashinfer_cutlass():
             assert (
                 hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
@@ -765,18 +734,27 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             get_moe_runner_backend().is_flashinfer_trtllm()
             and TopKOutputChecker.format_is_bypassed(topk_output)
         ):
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                FlashInferTrtllmFp8MoeQuantInfo,
-                fused_experts_none_to_flashinfer_trtllm_fp8,
-            )
-            from sglang.srt.layers.moe.utils import RoutingMethodType
-
+            router_logits = topk_output.router_logits
             topk_config = topk_output.topk_config
 
-            # Constraints for ModelOpt FP8 MoE
+            # Constraints
             assert (
                 self.moe_runner_config.activation == "silu"
             ), "Only silu is supported for flashinfer fp8 moe"
+
+            from flashinfer import RoutingMethodType
+            from flashinfer.fused_moe import trtllm_fp8_per_tensor_scale_moe
+
+            correction_bias = (
+                None
+                if topk_config.correction_bias is None
+                else topk_config.correction_bias
+            )
+            # Pre-quantize activations to FP8 per-tensor using provided input scale
+            x_fp8, _ = scaled_fp8_quant(x, layer.w13_input_scale)
+
+            use_routing_scales_on_input = True
+            routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
 
             # Enforce Llama4 routing for ModelOpt FP8 MoE for now.
             # TODO(brayden): support other routing methods
@@ -787,26 +765,50 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             assert (
                 not topk_config.topk_group
             ), "ModelOpt FP8 MoE does not support grouped top-k"
+            routing_method_type = RoutingMethodType.Llama4
 
-            quant_info = FlashInferTrtllmFp8MoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                global_num_experts=layer.num_experts,
-                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-                local_num_experts=layer.num_local_experts,
-                intermediate_size=layer.w2_weight.shape[2],
-                routing_method_type=RoutingMethodType.Llama4,
-                block_quant=False,
-                w13_input_scale=layer.w13_input_scale,
-                output1_scales_scalar=layer.output1_scales_scalar,
-                output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
-                output2_scales_scalar=layer.output2_scales_scalar,
-                use_routing_scales_on_input=True,
+            # FlashInfer TRTLLM requires routing_logits (and bias) to be bfloat16
+            routing_logits_cast = router_logits.to(torch.bfloat16)
+            routing_bias_cast = (
+                None if correction_bias is None else correction_bias.to(torch.bfloat16)
             )
 
-            return fused_experts_none_to_flashinfer_trtllm_fp8(
-                dispatch_output, quant_info, self.moe_runner_config
-            )
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
+                # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
+                # so we put the whole function under the ``use_symmetric_memory`` context manager.
+                # If the bug is fixed, we can only put the output tensor allocation under the context manager.
+                output = trtllm_fp8_per_tensor_scale_moe(
+                    routing_logits=routing_logits_cast,
+                    routing_bias=routing_bias_cast,
+                    hidden_states=x_fp8,
+                    gemm1_weights=layer.w13_weight,
+                    output1_scales_scalar=layer.output1_scales_scalar,
+                    output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
+                    gemm2_weights=layer.w2_weight,
+                    output2_scales_scalar=layer.output2_scales_scalar,
+                    num_experts=layer.num_experts,
+                    top_k=topk_config.top_k,
+                    n_group=0,
+                    topk_group=0,
+                    intermediate_size=layer.w2_weight.shape[2],
+                    local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                    local_num_experts=layer.num_local_experts,
+                    routed_scaling_factor=(
+                        routed_scaling_factor
+                        if routed_scaling_factor is not None
+                        else 1.0
+                    ),
+                    use_routing_scales_on_input=use_routing_scales_on_input,
+                    routing_method_type=routing_method_type,
+                    tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                )
+
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            return StandardCombineInput(hidden_states=output)
 
         if get_moe_runner_backend().is_flashinfer_cutlass():
             activation = ACT_STR_TO_TYPE_MAP[self.moe_runner_config.activation]
@@ -1159,6 +1161,26 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # SM120 workaround: dequantize FP4 dense weights → BF16.
+        # On SM120, the FlashInfer fp4_quantize + cutlass_scaled_fp4_mm path
+        # is extremely slow (5 tok/s vs 131 tok/s for BF16). Dequantize at
+        # load time and use standard cuBLAS BF16 GEMM for full throughput.
+        if is_sm120_supported():
+            weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+            w_bf16 = _dequant_nvfp4_to_bf16(
+                layer.weight.data.unsqueeze(0),
+                layer.weight_scale.data.unsqueeze(0),
+                weight_scale_2.unsqueeze(0),
+            ).squeeze(0)  # [N, K] bfloat16
+
+            # Replace FP4 weights with BF16
+            for attr in ["weight", "weight_scale", "weight_scale_2", "input_scale"]:
+                if hasattr(layer, attr):
+                    delattr(layer, attr)
+            layer.weight = Parameter(w_bf16, requires_grad=False)
+            layer._sm120_bf16_fallback = True
+            return
+
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
         layer.input_scale = Parameter(input_scale_2, requires_grad=False)
@@ -1169,75 +1191,39 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.input_scale_inv = Parameter(
             (1 / input_scale_2).to(torch.float32), requires_grad=False
         )
-
-        # Store original output size before any padding
-        layer.output_size_per_partition = layer.weight.shape[0]
-
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
             # shuffles ourselves.
-            #
-            # Alignment requirements:
-            #   - shuffle_matrix_a: weight.shape[0] (N) % 32 == 0
-            #   - shuffle_matrix_sf_a: scale.shape[0] (N) % 128 == 0, scale.shape[1] (K/16) % 4 == 0
-            # We pad N to multiple of 128 and K/16 to multiple of 4.
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
-            # Pad weight N dimension to 128
-            weight, _ = pad_nvfp4_weight(
-                layer.weight.data, n_alignment=128, k_alignment=0
-            )
-            # Pad scale N dimension to match weight
+            weight = layer.weight
             scale = layer.weight_scale
-            if scale.shape[0] != weight.shape[0]:
-                pad_n = weight.shape[0] - scale.shape[0]
-                scale = torch.nn.functional.pad(scale, (0, 0, 0, pad_n))
-
-            # Pad K dimension: scale K/16 must be multiple of 4
-            scale_k = scale.shape[1]  # K/16
-            weights_padding_cols = 0
-            if scale_k % 4 != 0:
-                padded_scale_k = round_up_to_multiple(scale_k, 4)
-                pad_scale_k = padded_scale_k - scale_k
-                # Pad scale K/16 dimension
-                scale = torch.nn.functional.pad(scale, (0, pad_scale_k, 0, 0))
-                # Pad weight K/2 dimension correspondingly (K/2 = K/16 * 8)
-                pad_weight_k = pad_scale_k * 8
-                weight = torch.nn.functional.pad(weight, (0, pad_weight_k, 0, 0))
-                # Store K padding for activation padding in apply()
-                weights_padding_cols = pad_weight_k
-
-            # Shuffle for TRTLLM layout
             epilogue_tile_m = 128
-            shuffled_scale_shape = scale.shape
             weight = shuffle_matrix_a(weight.view(torch.uint8), epilogue_tile_m)
             scale = (
                 shuffle_matrix_sf_a(scale.view(torch.uint8), epilogue_tile_m)
-                .reshape(shuffled_scale_shape)
+                .reshape(scale.shape)
                 .view(torch.float8_e4m3fn)
             )
 
             layer.weight_scale_interleaved = Parameter(scale, requires_grad=False)
             layer.weight = Parameter(weight, requires_grad=False)
-            layer.weights_padding_cols = weights_padding_cols
             return
-
-        # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
-        weight, weights_padding_cols = pad_nvfp4_weight(layer.weight.data)
-        layer.weights_padding_cols = weights_padding_cols
-        layer.weight = Parameter(weight, requires_grad=False)
-
         # Pad and blockwise interleave weight_scale
+        # Both FlashInfer and sgl_kernel CUTLASS paths expect swizzled block
+        # scales. sgl_kernel.scaled_fp4_quant returns swizzled input scales at
+        # runtime, so weight scales must also be swizzled to match.
         scales = layer.weight_scale
         scale_ndim = scales.ndim
         if scale_ndim == 2:
             scales = scales.unsqueeze(0)
         assert scales.ndim == 3
         B, M, K = scales.shape
-        M_padded = round_up_to_multiple(M, 128)
-        K_padded = round_up_to_multiple(K, 4)
+        round_up_multiple = lambda x, m: (x + m - 1) // m * m
+        M_padded = round_up_multiple(M, 128)
+        K_padded = round_up_multiple(K, 4)
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
         batches, rows, cols = padded_scales.shape
@@ -1259,13 +1245,14 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # SM120 BF16 fallback: standard cuBLAS matmul
+        if getattr(layer, '_sm120_bf16_fallback', False):
+            return torch.nn.functional.linear(x, layer.weight, bias)
+
         output_dtype = x.dtype
         x_m, _ = x.shape
-
-        # Get original output size (before padding) and padded weight size
-        output_size = layer.output_size_per_partition
         w_n, _ = layer.weight.shape
-        output_shape = [x_m, output_size]
+        output_shape = [x_m, w_n]
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
@@ -1275,16 +1262,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
         assert layer.alpha.dtype == torch.float32
 
-        # Pad activations to match weight K-dimension padding
-        weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
-        x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
-
         w = layer.weight
         w_scale_interleaved = layer.weight_scale_interleaved
         if enable_flashinfer_fp4_gemm:
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T
-
         out = fp4_gemm(
             x_fp4,
             w,
@@ -1294,13 +1276,61 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             output_dtype,
             w_n,
         )
-
-        # Slice output to remove N-dimension padding
-        out = slice_nvfp4_output(out, output_size)
-
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
+
+
+def _dequant_nvfp4_to_bf16(
+    weight_packed: torch.Tensor,
+    blockscale: torch.Tensor,
+    per_tensor_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize NVFP4 packed weights to BF16.
+
+    Used as SM120 workaround: FlashInfer fused CUTLASS FP4 MoE kernel
+    hangs on SM120 (Blackwell desktop GPUs). By dequantizing to BF16 at
+    load time, we can use the well-optimized triton fused MoE kernel.
+
+    Args:
+        weight_packed: [E, N, K//2] uint8 — two FP4 E2M1 values per byte.
+        blockscale: [E, N, K//16] float8_e4m3fn — one scale per 16 elements.
+        per_tensor_scale: [E] float32 — per-expert scale factor.
+
+    Returns:
+        [E, N, K] bfloat16 dequantized weights.
+    """
+    _FP4_E2M1_LUT = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+         0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        dtype=torch.float32,
+        device=weight_packed.device,
+    )
+
+    E, N, K_half = weight_packed.shape
+    K = K_half * 2
+
+    # Unpack: low nibble = even elements, high nibble = odd elements
+    low = (weight_packed & 0x0F).long()
+    high = ((weight_packed >> 4) & 0x0F).long()
+    unpacked = torch.stack([low, high], dim=-1).reshape(E, N, K)
+
+    # Look up FP4 values via table
+    values = _FP4_E2M1_LUT[unpacked]  # [E, N, K] float32
+
+    # Apply block scales: one scale per 16 elements along K dimension
+    bs_f32 = blockscale.to(torch.float32)  # [E, N, K//16]
+    K_blocks = bs_f32.shape[2]
+    values = values.reshape(E, N, K_blocks, 16) * bs_f32.unsqueeze(-1)
+    values = values.reshape(E, N, K)
+
+    # Apply per-tensor scale (per expert)
+    if per_tensor_scale.dim() == 0:
+        values = values * per_tensor_scale
+    else:
+        values = values * per_tensor_scale.view(E, 1, 1)
+
+    return values.to(torch.bfloat16)
 
 
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
@@ -1322,6 +1352,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             get_moe_runner_backend().is_flashinfer_trtllm()
         )
         self._cache_permute_indices = {}
+        self._sm120_bf16_fallback = is_sm120_supported()
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
@@ -1469,11 +1500,86 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+    def _process_weights_sm120_bf16(self, layer: torch.nn.Module) -> None:
+        """SM120 workaround: dequantize NVFP4 MoE weights to BF16.
+
+        FlashInfer's fused CUTLASS FP4 MoE kernel (flashinfer_cutlass_fused_moe)
+        hangs on SM120 (Blackwell desktop GPUs, e.g. RTX PRO 6000) — both in
+        eager mode and CUDA graph capture. The fallback cutlass_moe_fp4 uses
+        8+ separate kernel launches per MoE layer, causing 33x throughput loss.
+
+        Fix: dequantize FP4 expert weights to BF16 at load time and use the
+        well-optimized triton fused MoE kernel (1 kernel launch per layer).
+        This trades ~20 GB extra GPU memory for full throughput parity with
+        the base BF16 model.
+        """
+        logger.info(
+            "SM120 PATCH: Dequantizing NVFP4 MoE weights → BF16 for triton "
+            "fused MoE kernel (flashinfer_cutlass_fused_moe hangs on SM120)."
+        )
+
+        # Get per-tensor scales before modification
+        if layer.moe_runner_config.is_gated:
+            w13_pts = layer.w13_weight_scale_2.data[:, 0].clone()
+        else:
+            w13_pts = layer.w13_weight_scale_2.data.clone()
+        w2_pts = layer.w2_weight_scale_2.data.clone()
+
+        # Dequantize FP4 → BF16
+        w13_bf16 = _dequant_nvfp4_to_bf16(
+            layer.w13_weight.data,
+            layer.w13_weight_scale.data,
+            w13_pts,
+        )
+        w2_bf16 = _dequant_nvfp4_to_bf16(
+            layer.w2_weight.data,
+            layer.w2_weight_scale.data,
+            w2_pts,
+        )
+
+        # Log memory impact
+        fp4_bytes = (
+            layer.w13_weight.numel() + layer.w2_weight.numel()
+            + layer.w13_weight_scale.numel() + layer.w2_weight_scale.numel()
+        )
+        bf16_bytes = w13_bf16.numel() * 2 + w2_bf16.numel() * 2
+        logger.info(
+            "  FP4 → BF16: %.1f MB → %.1f MB (+%.1f MB per MoE layer)",
+            fp4_bytes / 1e6, bf16_bytes / 1e6, (bf16_bytes - fp4_bytes) / 1e6,
+        )
+
+        # Delete FP4-specific tensors to free GPU memory
+        for attr in [
+            "w13_weight", "w2_weight",
+            "w13_weight_scale", "w2_weight_scale",
+            "w13_weight_scale_2", "w2_weight_scale_2",
+            "w13_blockscale_swizzled", "w2_blockscale_swizzled",
+            "w13_input_scale", "w2_input_scale",
+        ]:
+            if hasattr(layer, attr):
+                delattr(layer, attr)
+
+        # Store BF16 weights
+        layer.w13_weight = Parameter(w13_bf16, requires_grad=False)
+        layer.w2_weight = Parameter(w2_bf16, requires_grad=False)
+
+        # Configure dispatcher: no FP4 input quantization for BF16 path
+        layer.dispatcher.set_quant_config({"input_global_scale": None})
+
+        # Set flag for apply()
+        layer._sm120_bf16_fallback = True
+
+        torch.cuda.empty_cache()
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
+        # SM120 workaround: dequantize to BF16 and use triton fused MoE
+        if self._sm120_bf16_fallback and not self.enable_flashinfer_trtllm_moe:
+            self._process_weights_sm120_bf16(layer)
+            return
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
@@ -1545,7 +1651,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32), requires_grad=False
         )
 
-        # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
@@ -1590,12 +1695,49 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             and reorder_rows_for_gated_act_gemm is not None
             and shuffle_matrix_sf_a is not None
         ):
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                align_fp4_moe_weights_for_flashinfer_trtllm,
+            # FlashInfer TRTLLM processing - handles both w13 and w2
+            (
+                gemm1_weights_fp4_shuffled,
+                gemm1_scales_fp4_shuffled,
+                gemm2_weights_fp4_shuffled,
+                gemm2_scales_fp4_shuffled,
+            ) = prepare_static_weights_for_trtllm_fp4_moe(
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                layer.w2_weight.size(-2),  # hidden_size
+                layer.w13_weight.size(-2) // 2,  # intermediate_size
+                layer.w13_weight.size(0),  # num_experts
             )
 
-            # FlashInfer TRTLLM processing - handles both w13 and w2
-            align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+            # Set flashinfer parameters
+            layer.gemm1_weights_fp4_shuffled = Parameter(
+                gemm1_weights_fp4_shuffled, requires_grad=False
+            )
+            layer.gemm2_weights_fp4_shuffled = Parameter(
+                gemm2_weights_fp4_shuffled, requires_grad=False
+            )
+            layer.gemm1_scales_fp4_shuffled = Parameter(
+                gemm1_scales_fp4_shuffled, requires_grad=False
+            )
+            layer.gemm2_scales_fp4_shuffled = Parameter(
+                gemm2_scales_fp4_shuffled, requires_grad=False
+            )
+
+            # Additional parameter needed for TRT-LLM
+            layer.g1_scale_c = Parameter(
+                (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
+                requires_grad=False,
+            )
+
+            # Clean up weights that won't be used by TRT-LLM
+            del (
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                layer.w13_weight,
+                layer.w13_weight_scale,
+            )
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -1665,9 +1807,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if get_moe_runner_backend().is_flashinfer_trtllm():
-            self.runner = MoeRunner(
-                MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
+        if self._sm120_bf16_fallback:
+            self._triton_runner = MoeRunner(
+                MoeRunnerBackend.TRITON, moe_runner_config
             )
 
     def apply(
@@ -1675,6 +1817,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+
+        # SM120 BF16 fallback: use triton fused MoE with dequantized weights
+        if getattr(layer, '_sm120_bf16_fallback', False):
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+            )
+            return self._triton_runner.run(dispatch_output, quant_info)
 
         x = dispatch_output.hidden_states
         x_sf = dispatch_output.hidden_states_scale
@@ -1687,40 +1837,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
 
-        # FlashInfer TRTLLM FP4 path - layer has shuffled weights only when
-        # backend is flashinfer_trtllm
+        # Check if this is a FlashInferFP4MoE layer that should handle its own forward
         if hasattr(layer, "gemm1_weights_fp4_shuffled"):
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                FlashInferTrtllmFp4MoeQuantInfo,
-            )
-            from sglang.srt.layers.moe.utils import RoutingMethodType
+            # This layer was processed with flashinfer TRTLLM - delegate to its own forward
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-            # Determine routing method type based on layer configuration
-            routing_method_type = getattr(
-                layer, "routing_method_type", RoutingMethodType.Default
-            )
-
-            quant_info = FlashInferTrtllmFp4MoeQuantInfo(
-                gemm1_weights_fp4_shuffled=layer.gemm1_weights_fp4_shuffled.data,
-                gemm2_weights_fp4_shuffled=layer.gemm2_weights_fp4_shuffled.data,
-                gemm1_scales_fp4_shuffled=layer.gemm1_scales_fp4_shuffled.data,
-                gemm2_scales_fp4_shuffled=layer.gemm2_scales_fp4_shuffled.data,
-                g1_scale_c=layer.g1_scale_c.data,
-                g1_alphas=layer.g1_alphas.data,
-                g2_alphas=layer.g2_alphas.data,
-                w13_input_scale_quant=layer.w13_input_scale_quant,
-                global_num_experts=layer.num_experts,
-                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-                local_num_experts=layer.num_local_experts,
-                intermediate_size_per_partition=layer.intermediate_size_per_partition,
-                routing_method_type=routing_method_type,
-            )
-
-            return self.runner.run(dispatch_output, quant_info)
+            return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
 
         if self.enable_flashinfer_cutlass_moe:
-            from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
-
             assert (
                 not moe_runner_config.apply_router_weight_on_input
             ), "apply_router_weight_on_input is not supported for Flashinfer"
@@ -1730,23 +1854,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             output_dtype = torch.bfloat16
 
-            if DispatchOutputChecker.format_is_flashinfer(dispatch_output):
-                symm_output = dispatch_output.moe_output
-            else:
-                # If x_sf is not None, x is FP4 packed (half size), so we need * 2
-                # If x_sf is None, x is not packed, so output_col = x.shape[1]
-                output_col = x.shape[1]
-                if x_sf is not None and layer.moe_runner_config.is_gated:
-                    output_col *= 2
-                with use_symmetric_memory(
-                    get_tp_group(), disabled=not is_allocation_symmetric()
-                ):
-                    symm_output = torch.empty(
-                        x.shape[0],
-                        output_col,
-                        dtype=output_dtype,
-                        device=x.device,
-                    )
+            # If x_sf is not None, x is FP4 packed (half size), so we need * 2
+            # If x_sf is None, x is not packed, so output_col = x.shape[1]
+            output_col = x.shape[1]
+            if x_sf is not None and layer.moe_runner_config.is_gated:
+                output_col *= 2
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                symm_output = torch.empty(
+                    x.shape[0],
+                    output_col,
+                    dtype=output_dtype,
+                    device=x.device,
+                )
 
             output = flashinfer_cutlass_fused_moe(
                 output=symm_output,
@@ -1757,7 +1878,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 fc2_expert_weights=layer.w2_weight.view(torch.long),
                 output_dtype=output_dtype,
                 input_sf=x_sf,
-                # swizzled_input_sf=not get_moe_a2a_backend().is_flashinfer(),
                 quant_scales=[
                     layer.w13_input_scale_quant,
                     layer.w13_blockscale_swizzled.view(torch.int32),
@@ -1772,7 +1892,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
                 activation_type=ACT_STR_TO_TYPE_MAP[activation],
-                enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
             )[0]
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput

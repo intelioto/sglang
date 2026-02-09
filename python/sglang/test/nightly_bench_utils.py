@@ -31,7 +31,6 @@ class BenchmarkResult(BaseModel):
     acc_length: Optional[float] = None
     profile_link_extend: Optional[str] = None
     profile_link_decode: Optional[str] = None
-    server_args: Optional[List[str]] = None
 
     @staticmethod
     def help_str() -> str:
@@ -123,10 +122,7 @@ def generate_markdown_report(
 
 
 def save_results_as_pydantic_models(
-    results: List,
-    pydantic_result_filename: str,
-    model_path: str,
-    server_args: Optional[List[str]] = None,
+    results: List, pydantic_result_filename: str, model_path: str
 ):
     """Save benchmark results as JSON using Pydantic models."""
     json_results = []
@@ -171,7 +167,6 @@ def save_results_as_pydantic_models(
             acc_length=res.acc_length,
             profile_link_extend=profile_link_extend,
             profile_link_decode=profile_link_decode,
-            server_args=server_args,
         )
         json_results.append(benchmark_result.model_dump())
 

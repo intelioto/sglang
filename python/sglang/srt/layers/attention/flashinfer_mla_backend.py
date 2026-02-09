@@ -28,6 +28,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     is_flashinfer_available,
     is_sm100_supported,
+    is_sm120_supported,
     next_power_of_2,
 )
 
@@ -247,6 +248,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             self.fmha_backend = "cutlass"
         else:
             self.fmha_backend = "auto"
+
+        # SM120 (Blackwell desktop/workstation, e.g. RTX PRO 6000):
+        # FlashInfer's FA2 MLA decode kernel produces incorrect results on SM120.
+        # All specialized alternatives (XQA=FP8 only, cutlass_mla=SM100, trtllm-gen=SM100)
+        # are incompatible. Use the MLA prefill kernel for decode instead — it is
+        # architecture-agnostic and still a fused CUDA kernel (unlike manual PyTorch).
+        # The decode updater passes is_prefill=True to wrapper.plan() on SM120.
+        self._use_prefill_for_decode = is_sm120_supported()
 
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=self.fmha_backend
@@ -652,7 +661,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-
 class FlashInferMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
@@ -665,6 +673,10 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.dtype
         self.attn_backend = attn_backend
+        # SM120: use MLA prefill kernel for decode (FA2 decode kernel is broken)
+        self._use_prefill_for_decode = getattr(
+            attn_backend, "_use_prefill_for_decode", False
+        )
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
@@ -730,6 +742,11 @@ class FlashInferMLAIndicesUpdaterDecode:
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
+        # SM120: use prefill kernel for decode (FA2 decode kernel broken on SM120).
+        # The MLA prefill kernel is architecture-agnostic and handles 1-token-per-
+        # request correctly (each decode token attends to all prior KV entries).
+        is_prefill = self._use_prefill_for_decode
+
         if not init_metadata_replay:
             wrapper.plan(
                 q_indptr,
@@ -740,7 +757,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
                 1,
-                False,
+                is_prefill,
                 sm_scale,
                 self.data_type,
                 self.data_type,
@@ -755,7 +772,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
                 1,
-                False,
+                is_prefill,
                 sm_scale,
                 self.data_type,
                 self.data_type,

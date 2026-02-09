@@ -118,67 +118,47 @@ class Hf3fsUsrBioClient(Hf3fsClient):
     @rsynchronized()
     def batch_read(self, offsets: List[int], tensors: List[torch.Tensor]) -> List[int]:
         self.check(offsets, tensors)
-        results = [0] * len(offsets)
+
         # prepare
         current = 0
         for offset, tensor in zip(offsets, tensors):
             size = tensor.numel() * tensor.itemsize
-            try:
-                self.ior_r.prepare(
-                    self.iov_r[current : current + size], True, self.file, offset
-                )
-                current += size
-            except Exception as e:
-                logger.error(f"Error preparing batch read: {e}")
-                return results
+            self.ior_r.prepare(
+                self.iov_r[current : current + size], True, self.file, offset
+            )
+            current += size
+
         # submit
         ionum = len(offsets)
-        try:
-            resv = self.ior_r.submit().wait(
-                min_results=ionum,
-                timeout=datetime.timedelta(seconds=self.client_timeout),
-            )
-        except Exception as e:
-            logger.error(f"Error submitting batch read: {e}")
-            return results
+        resv = self.ior_r.submit().wait(
+            min_results=ionum, timeout=datetime.timedelta(seconds=self.client_timeout)
+        )
+
         # results
-        try:
-            hf3fs_utils.read_shm(self.shm_r_tensor, tensors)
-            results = [res.result for res in resv]
-        except Exception as e:
-            logger.error(f"[Hf3fsUsrBioClient] read_shm failed: {e}", exc_info=True)
-            return results
+        hf3fs_utils.read_shm(self.shm_r_tensor, tensors)
+        results = [res.result for res in resv]
 
         return results
 
     @wsynchronized()
     def batch_write(self, offsets: List[int], tensors: List[torch.Tensor]) -> List[int]:
         self.check(offsets, tensors)
-        results = [0] * len(offsets)
+
         # prepare
         hf3fs_utils.write_shm(tensors, self.shm_w_tensor)
         current = 0
         for offset, tensor in zip(offsets, tensors):
             size = tensor.numel() * tensor.itemsize
-            try:
-                self.ior_w.prepare(
-                    self.iov_w[current : current + size], False, self.file, offset
-                )
-                current += size
-            except Exception as e:
-                logger.error(f"Error preparing batch write: {e}")
-                return results
+            self.ior_w.prepare(
+                self.iov_w[current : current + size], False, self.file, offset
+            )
+            current += size
 
         # submit
         ionum = len(offsets)
-        try:
-            resv = self.ior_w.submit().wait(
-                min_results=ionum,
-                timeout=datetime.timedelta(seconds=self.client_timeout),
-            )
-        except Exception as e:
-            logger.error(f"Error submitting batch write: {e}")
-            return results
+        resv = self.ior_w.submit().wait(
+            min_results=ionum, timeout=datetime.timedelta(seconds=self.client_timeout)
+        )
 
         # results
         results = [res.result for res in resv]

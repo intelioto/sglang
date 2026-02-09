@@ -16,7 +16,10 @@ def register_image_processor(
     register customized hf image processor while removing hf impl
     """
     AutoImageProcessor.register(
-        config, slow_image_processor_class=image_processor, exist_ok=True
+        config,
+        slow_image_processor_class=image_processor,
+        fast_image_processor_class=None,
+        exist_ok=True,
     )
 
 

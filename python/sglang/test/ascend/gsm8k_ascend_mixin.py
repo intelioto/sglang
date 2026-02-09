@@ -14,7 +14,6 @@ from sglang.test.test_utils import (
 class GSM8KAscendMixin(ABC):
     model = ""
     accuracy = 0.00
-    timeout_for_server_launch = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
@@ -23,7 +22,6 @@ class GSM8KAscendMixin(ABC):
         "ascend",
         "--disable-cuda-graph",
     ]
-    gsm8k_num_shots = 5
 
     @classmethod
     def setUpClass(cls):
@@ -43,7 +41,7 @@ class GSM8KAscendMixin(ABC):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=cls.timeout_for_server_launch,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=cls.other_args,
             env=env,
         )
@@ -54,7 +52,7 @@ class GSM8KAscendMixin(ABC):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=self.gsm8k_num_shots,
+            num_shots=5,
             data_path=None,
             num_questions=200,
             max_new_tokens=512,
@@ -63,7 +61,7 @@ class GSM8KAscendMixin(ABC):
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval(args)
-        self.assertGreaterEqual(
+        self.assertGreater(
             metrics["accuracy"],
             self.accuracy,
             f'Accuracy of {self.model} is {str(metrics["accuracy"])}, is lower than {self.accuracy}',

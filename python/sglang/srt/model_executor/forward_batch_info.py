@@ -799,7 +799,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 setattr(self, "_original_batch_size", self.batch_size)
                 if self.spec_info is not None:
                     bs = self.batch_size = (
-                        num_tokens // self.spec_info.num_tokens_per_req
+                        num_tokens // self.spec_info.num_tokens_per_batch
                     )
                 else:
                     bs = self.batch_size = num_tokens
@@ -860,15 +860,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if self.mrope_positions is not None:
-            self.mrope_positions = torch.cat(
-                [
-                    self.mrope_positions,
-                    self.mrope_positions.new_zeros(
-                        3, num_tokens - self.mrope_positions.shape[1]
-                    ),
-                ],
-                dim=1,
-            )
+            self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
 
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
@@ -935,7 +927,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
-                bs = bs * self.spec_info.num_tokens_per_req
+                bs = bs * self.spec_info.num_tokens_per_batch
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():

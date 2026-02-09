@@ -440,7 +440,7 @@ class Glm4MoeLiteModel(DeepseekV2Model):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                use_attn_tp_group=is_dp_attention_enabled(),
+                enable_tp=not is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -467,6 +467,18 @@ class Glm4MoeLiteModel(DeepseekV2Model):
 
 
 class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
+    # Tell the quantization system about fused modules so it creates compatible
+    # packed parameters and weight loaders for quantized checkpoints (e.g. INT4/Marlin).
+    # Without this, compressed-tensors creates Marlin-format parameters for the fused
+    # projection but load_weights tries to load raw concatenated checkpoint weights,
+    # causing an AssertionError on size mismatch.
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": [
+            "q_a_proj",
+            "kv_a_proj_with_mqa",
+        ]
+    }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -479,6 +491,12 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+
+        # Fuse q_a_proj and kv_a_proj_with_mqa (mirrors DeepseekV2ForCausalLM.__init__)
+        self.fuse_qkv_a_proj = (
+            hasattr(config, "q_lora_rank") and config.q_lora_rank is not None
+        )
+
         self.determine_num_fused_shared_experts("Glm4MoeLiteForCausalLM")
         self.model = Glm4MoeLiteModel(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -531,7 +549,7 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
         ):
             disable_reason = "Only GLM-4.5 or GLM-4.6 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
-            disable_reason = "GLM-4.5 or GLM-4.6 cannot use shared experts fusion optimization under expert parallelism."
+            disable_reason = "GLM-4.5 or GLM-4.6 can not use shared experts fusion optimization under expert parallelism."
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
@@ -751,9 +769,7 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
                         ):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
-                            )
+
                             param_name = (
                                 name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
                                 if "q_a_proj" in name
@@ -762,8 +778,34 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
                                 )
                             )
                             if param_name not in params_dict:
+                                cached_a_proj.pop(q_a_proj_name)
+                                cached_a_proj.pop(kv_a_proj_name)
                                 continue
                             param = params_dict[param_name]
+
+                            # weight_shape is a metadata tensor [out, in] — compute
+                            # the correct fused shape instead of blindly concatenating.
+                            if param_name.endswith(".weight_shape"):
+                                # Both q_a_proj and kv_a_proj share the same input dim;
+                                # the fused output dim is the sum of the two output dims.
+                                fused_weight = torch.tensor(
+                                    [q_a_proj_weight[0].item() + kv_a_proj_weight[0].item(),
+                                     q_a_proj_weight[1].item()],
+                                    dtype=q_a_proj_weight.dtype,
+                                )
+                            elif q_a_proj_weight.dim() == 0 or kv_a_proj_weight.dim() == 0:
+                                # Scalar tensors (e.g. weight_scale_2, input_scale from
+                                # ModelOpt NVFP4) are per-tensor scales that cannot be
+                                # concatenated. Take the max to preserve dynamic range
+                                # in the fused projection.
+                                fused_weight = torch.max(q_a_proj_weight, kv_a_proj_weight)
+                            else:
+                                # weight_packed, weight_scale, weight: concatenate along
+                                # output dim (dim=0), which is safe for group-quantized
+                                # weights where groups are along the input dim.
+                                fused_weight = torch.cat(
+                                    [q_a_proj_weight, kv_a_proj_weight], dim=0
+                                )
 
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader

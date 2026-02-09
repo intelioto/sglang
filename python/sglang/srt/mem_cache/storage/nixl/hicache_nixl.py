@@ -8,12 +8,7 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 
-from .nixl_utils import (
-    NixlBackendConfig,
-    NixlBackendSelection,
-    NixlFileManager,
-    NixlRegistration,
-)
+from .nixl_utils import NixlBackendSelection, NixlFileManager, NixlRegistration
 
 try:
     from nixl._api import nixl_agent, nixl_agent_config
@@ -34,15 +29,9 @@ class HiCacheNixl(HiCacheStorage):
         self,
         storage_config: HiCacheStorageConfig,
         file_path: str = "/tmp/hicache_storage",
+        plugin: str = "auto",
     ):
         """Initialize NIXL storage connector."""
-
-        # create nixlconfig from the --hicache-storage-backend-extra-config
-        nixlconfig = NixlBackendConfig(storage_config.extra_config)
-
-        # select the NIXL backend plugin from extra_config or environment variable
-        plugin = nixlconfig.get_specified_plugin()
-
         # Might be better to be unified across HiCache backends and moved to HiCacheController
         file_path = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR", file_path)
         self.file_manager = (
@@ -68,7 +57,7 @@ class HiCacheNixl(HiCacheStorage):
         self.agent_name = f"hicache_nixl_{str(uuid.uuid4())}"
         self.agent = nixl_agent(self.agent_name, agent_config)
 
-        self.backend_selector = NixlBackendSelection(plugin, nixlconfig)
+        self.backend_selector = NixlBackendSelection(plugin)
         if not self.backend_selector.create_backend(self.agent):
             raise RuntimeError("Failed to create NIXL backend")
 

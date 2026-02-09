@@ -242,7 +242,6 @@ class Llama4Attention(nn.Module):
             RMSNorm(
                 hidden_size=self.head_dim,
                 eps=config.rms_norm_eps,
-                has_weight=False,
             )
             if self.use_qk_norm
             else None
@@ -487,7 +486,7 @@ class Llama4Model(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
-            use_attn_tp_group=is_dp_attention_enabled(),
+            enable_tp=not is_dp_attention_enabled(),
         )
         self.layers = make_layers(
             config.num_hidden_layers,

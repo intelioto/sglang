@@ -119,6 +119,11 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             layer.weight_packed = Parameter(weight, requires_grad=False)
         else:
+            # Both FlashInfer and sgl_kernel CUTLASS paths expect swizzled
+            # block scales. sgl_kernel.scaled_fp4_quant (used for input
+            # quantization at runtime) also returns swizzled scales, so both
+            # input_sf and weight_sf are in the same interleaved layout when
+            # passed to cutlass_scaled_fp4_mm / flashinfer mm_fp4.
             swizzled_weight_scale = swizzle_blockscale(layer.weight_scale)
             layer.weight_scale = Parameter(swizzled_weight_scale, requires_grad=False)
             layer.weight_packed = Parameter(

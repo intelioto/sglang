@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSATokenToKVPool,
+    MLATokenToKVPoolFP4,
 )
 from sglang.srt.utils import is_cuda, is_npu, is_xpu
 
@@ -694,9 +694,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
-        override_kv_cache_dim: Optional[int] = None,
     ):
-        self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -718,10 +716,13 @@ class MLATokenToKVPoolHost(HostKVCache):
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
         self.layer_num = self.device_pool.layer_num
-        self.kv_cache_dim = self.override_kv_cache_dim or (
-            self.kv_lora_rank + self.qk_rope_head_dim
+
+        return (
+            (self.kv_lora_rank + self.qk_rope_head_dim)
+            * 1
+            * self.dtype.itemsize
+            * self.layer_num
         )
-        return self.kv_cache_dim * self.dtype.itemsize * self.layer_num
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
@@ -732,14 +733,14 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.size,
                 1,
-                self.kv_cache_dim,
+                self.kv_lora_rank + self.qk_rope_head_dim,
             )
         elif self.layout == "page_first":
             dims = (
                 self.size,
                 self.layer_num,
                 1,
-                self.kv_cache_dim,
+                self.kv_lora_rank + self.qk_rope_head_dim,
             )
         elif self.layout == "page_first_direct":
             dims = (
@@ -747,7 +748,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.page_size,
                 1,
-                self.kv_cache_dim,
+                self.kv_lora_rank + self.qk_rope_head_dim,
             )
         # Ascend-specific: Aligns with NPUMLATokenToKVPool layout
         # Separately allocate k_buffer and v_buffer for easier data transfer.
@@ -773,21 +774,14 @@ class MLATokenToKVPoolHost(HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-            self.index_k_buffer = None
-            if self.device_pool.index_head_dim is not None:
-                self.index_k_buffer = alloc_func(
-                    (*base_dims, self.device_pool.index_head_dim),
-                    dtype=self.dtype,
-                    device=self.device,
-                    pin_memory=self.pin_memory,
-                    allocator=self.allocator,
-                )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
             return self.k_buffer
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
-        self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
+        self.token_stride_size = (
+            self.kv_lora_rank + self.qk_rope_head_dim
+        ) * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
@@ -855,8 +849,6 @@ class MLATokenToKVPoolHost(HostKVCache):
                         host_k=self.k_buffer,
                         device_v=device_pool.v_buffer,
                         host_v=self.v_buffer,
-                        device_index_k=device_pool.index_k_buffer,
-                        host_index_k=self.index_k_buffer,
                         page_size=self.page_size,
                         direction=TransferDirection.H2D,
                     )
@@ -918,8 +910,6 @@ class MLATokenToKVPoolHost(HostKVCache):
                     host_k=self.k_buffer,
                     device_v=device_pool.v_buffer,
                     host_v=self.v_buffer,
-                    device_index_k=device_pool.index_k_buffer,
-                    host_index_k=self.index_k_buffer,
                     page_size=self.page_size,
                     direction=TransferDirection.D2H,
                 )
@@ -948,7 +938,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.page_size,
                 1,
-                self.kv_cache_dim,
+                self.kv_lora_rank + self.qk_rope_head_dim,
             ),
             dtype=self.dtype,
             device=self.device,
@@ -961,14 +951,14 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.page_size,
                 1,
-                self.kv_cache_dim,
+                self.kv_lora_rank + self.qk_rope_head_dim,
             )
         elif self.layout == "page_first":
             self.kv_buffer[index : index + self.page_size, :, :, :] = data_page.reshape(
                 self.page_size,
                 self.layer_num,
                 1,
-                self.kv_cache_dim,
+                self.kv_lora_rank + self.qk_rope_head_dim,
             )
         elif self.layout == "page_first_direct":
             real_index = index // self.page_size
@@ -977,7 +967,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num,
                 self.page_size,
                 1,
-                self.kv_cache_dim,
+                self.kv_lora_rank + self.qk_rope_head_dim,
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -995,11 +985,20 @@ class MLATokenToKVPoolHost(HostKVCache):
                 for layer_id in range(self.layer_num):
                     k_ptr = (
                         kv_buffer_data_ptr
-                        + indices[index] * self.kv_cache_dim * self.dtype.itemsize
-                        + layer_id * self.size * self.kv_cache_dim * self.dtype.itemsize
+                        + indices[index]
+                        * (self.kv_lora_rank + self.qk_rope_head_dim)
+                        * self.dtype.itemsize
+                        + layer_id
+                        * self.size
+                        * (self.kv_lora_rank + self.qk_rope_head_dim)
+                        * self.dtype.itemsize
                     )
                     ptr_list.append(k_ptr)
-            element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
+            element_size = (
+                self.dtype.itemsize
+                * self.page_size
+                * (self.kv_lora_rank + self.qk_rope_head_dim)
+            )
             element_size_list = [element_size] * len(ptr_list)
         elif self.layout in ["page_first", "page_first_direct"]:
             for index in range(0, len(indices), self.page_size):
@@ -1007,7 +1006,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                     kv_buffer_data_ptr
                     + indices[index]
                     * self.layer_num
-                    * self.kv_cache_dim
+                    * (self.kv_lora_rank + self.qk_rope_head_dim)
                     * self.dtype.itemsize
                 )
                 ptr_list.append(k_ptr)
@@ -1015,7 +1014,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.layer_num
                 * self.dtype.itemsize
                 * self.page_size
-                * self.kv_cache_dim
+                * (self.kv_lora_rank + self.qk_rope_head_dim)
             )
             element_size_list = [element_size] * len(ptr_list)
         else:
@@ -1023,12 +1022,25 @@ class MLATokenToKVPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
 
-class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
-    device_pool: NSATokenToKVPool
+class MLATokenToKVPoolHostFP4(MLATokenToKVPoolHost):
+    """Host KV cache pool for FP4 (E2M1) MLA models.
+
+    Mirrors the GPU MLATokenToKVPoolFP4 layout:
+      - kv_buffer:       packed FP4 data, shape (..., 1, kv_cache_dim // 2), uint8
+      - kv_scale_buffer: block-wise dynamic scales, shape (..., kv_cache_dim // SCALE_BLOCK_SIZE), uint8
+
+    Both buffers are transferred independently between GPU and host so that
+    the packed FP4 representation is preserved on the host without any
+    dequantize/requantize overhead.
+    """
+
+    device_pool: MLATokenToKVPoolFP4
+
+    SCALE_BLOCK_SIZE: int = 16
 
     def __init__(
         self,
-        device_pool: NSATokenToKVPool,
+        device_pool: MLATokenToKVPoolFP4,
         host_to_device_ratio: float,
         host_size: int,
         page_size: int,
@@ -1036,15 +1048,10 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
-    ):
-        # Initialize indexer metadata before HostKVCache.__init__ calls get_size_per_token.
-        self.index_head_dim = device_pool.index_head_dim
-        self.indexer_quant_block_size = device_pool.quant_block_size
-        self.indexer_dtype = NSATokenToKVPool.index_k_with_scale_buffer_dtype
-        self.indexer_size_per_token = (
-            self.index_head_dim
-            + self.index_head_dim // self.indexer_quant_block_size * 4
-        )
+    ) -> None:
+        # HostKVCache.__init__ -> get_size_per_token() -> init_kv_buffer()
+        # init_kv_buffer() also creates self.kv_scale_buffer.
+        # MLATokenToKVPoolHost.__init__ then creates data_refs / data_ptrs for kv_buffer.
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -1054,113 +1061,188 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             pin_memory,
             device,
             allocator_type,
-            override_kv_cache_dim=device_pool.kv_cache_dim,
-        )
-        self.indexer_page_stride_size = (
-            self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
-        )
-        self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
-        self._init_indexer_buffers()
-        logger.info(
-            f"NSATokenToKVPoolHost initialized with indexer page stride size: {self.indexer_page_stride_size}, page num: {self.indexer_page_num}"
         )
 
-    def get_size_per_token(self):
-        base = super().get_size_per_token()
-        return (
-            base
-            + self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
+        # Per-layer views + pointer tensors for the scale buffer (host side).
+        self.scale_data_refs = [
+            self.kv_scale_buffer[i] for i in range(self.layer_num)
+        ]
+        self.scale_data_ptrs = torch.tensor(
+            [t.data_ptr() for t in self.scale_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
         )
 
-    def _init_indexer_buffers(self):
+        # Pointer tensor for the *device* scale buffers — needed by the
+        # kernel-based all-layer transfer which expects uint64 pointer tensors.
+        self.device_scale_data_ptrs = torch.tensor(
+            [t.data_ptr() for t in device_pool.kv_scale_buffer],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    # ------------------------------------------------------------------
+    # Size calculation
+    # ------------------------------------------------------------------
+
+    def get_size_per_token(self) -> int:
+        self.kv_lora_rank = self.device_pool.kv_lora_rank
+        self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
+        self.layer_num = self.device_pool.layer_num
+        self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        self.fp4_packed_dim = self.kv_cache_dim // 2
+        self.scale_dim = self.kv_cache_dim // self.SCALE_BLOCK_SIZE
+
+        # uint8 itemsize == 1 for both packed FP4 data and scales
+        return (self.fp4_packed_dim + self.scale_dim) * self.layer_num
+
+    def get_ksize_per_token(self) -> int:
+        return self.get_size_per_token()
+
+    # ------------------------------------------------------------------
+    # Buffer allocation
+    # ------------------------------------------------------------------
+
+    def init_kv_buffer(self) -> torch.Tensor:
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-        self.index_k_with_scale_buffer = [
-            alloc_func(
-                (self.indexer_page_num, self.indexer_page_stride_size),
-                dtype=self.indexer_dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-            )
-            for _ in range(self.layer_num)
-        ]
-        self.index_k_data_refs = [
-            self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
-        ]
-        self.index_k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.index_k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
-        self.index_k_device_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.device_pool.index_k_with_scale_buffer],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
 
-    def _get_indexer_page_indices(self, host_indices, device_indices):
-        if host_indices.numel() == 0:
-            return host_indices, device_indices
-        if host_indices.numel() % self.page_size != 0:
-            raise ValueError(
-                "Index buffer transfer expects page-aligned indices for NSA."
+        if self.layout == "layer_first":
+            kv_dims = (self.layer_num, self.size, 1, self.fp4_packed_dim)
+            scale_dims = (self.layer_num, self.size, self.scale_dim)
+        elif self.layout == "page_first":
+            kv_dims = (self.size, self.layer_num, 1, self.fp4_packed_dim)
+            scale_dims = (self.size, self.layer_num, self.scale_dim)
+        elif self.layout == "page_first_direct":
+            kv_dims = (
+                self.page_num,
+                self.layer_num,
+                self.page_size,
+                1,
+                self.fp4_packed_dim,
             )
-        host_page_indices = (
-            host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
-        )
-        device_page_indices = (
-            device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
-        )
-        return host_page_indices, device_page_indices
-
-    def _load_indexer_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        host_page_indices, device_page_indices = self._get_indexer_page_indices(
-            host_indices, device_indices
-        )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
-        if use_kernel:
-            transfer_kv_per_layer_mla(
-                src=self.index_k_with_scale_buffer[layer_id],
-                dst=device_pool.index_k_with_scale_buffer[layer_id],
-                src_indices=host_page_indices,
-                dst_indices=device_page_indices,
-                item_size=self.indexer_page_stride_size,
+            scale_dims = (
+                self.page_num,
+                self.layer_num,
+                self.page_size,
+                self.scale_dim,
             )
         else:
-            transfer_kv_direct(
-                src_layers=[self.index_k_with_scale_buffer[layer_id]],
-                dst_layers=[device_pool.index_k_with_scale_buffer[layer_id]],
-                src_indices=host_page_indices,
-                dst_indices=device_page_indices,
-                page_size=1,
-            )
+            raise ValueError(f"Unsupported layout: {self.layout}")
 
-    def _backup_indexer_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
-    ):
-        host_page_indices, device_page_indices = self._get_indexer_page_indices(
-            host_indices, device_indices
+        # Strides used by the kernel-based transfer (bytes per token).
+        self.token_stride_size = self.fp4_packed_dim  # uint8 itemsize == 1
+        self.scale_stride_size = self.scale_dim
+        self.layout_dim = self.token_stride_size * self.layer_num
+        self.scale_layout_dim = self.scale_stride_size * self.layer_num
+
+        self.kv_scale_buffer = alloc_func(
+            scale_dims,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
         )
-        use_kernel = io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
-        if use_kernel:
-            transfer_kv_all_layer_mla(
-                src_layers=self.index_k_device_ptrs,
-                dst_layers=self.index_k_data_ptrs,
-                src_indices=device_page_indices,
-                dst_indices=host_page_indices,
-                item_size=self.indexer_page_stride_size,
-                num_layers=self.layer_num,
-            )
+
+        buffer = alloc_func(
+            kv_dims,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+        return buffer
+
+    # ------------------------------------------------------------------
+    # Host <- Device (backup / evict)
+    # ------------------------------------------------------------------
+
+    def backup_from_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+    ) -> None:
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                # --- packed FP4 data ---
+                transfer_kv_all_layer_mla(
+                    src_layers=device_pool.data_ptrs,
+                    dst_layers=self.data_ptrs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.token_stride_size,
+                    num_layers=self.layer_num,
+                )
+                # --- FP4 scales ---
+                transfer_kv_all_layer_mla(
+                    src_layers=self.device_scale_data_ptrs,
+                    dst_layers=self.scale_data_ptrs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.scale_stride_size,
+                    num_layers=self.layer_num,
+                )
+            elif self.layout == "page_first":
+                transfer_kv_all_layer_mla_lf_pf(
+                    src_layers=device_pool.data_ptrs,
+                    dst=self.kv_buffer,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.token_stride_size,
+                    dst_layout_dim=self.layout_dim,
+                    num_layers=self.layer_num,
+                )
+                transfer_kv_all_layer_mla_lf_pf(
+                    src_layers=self.device_scale_data_ptrs,
+                    dst=self.kv_scale_buffer,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.scale_stride_size,
+                    dst_layout_dim=self.scale_layout_dim,
+                    num_layers=self.layer_num,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=device_pool.kv_buffer,
+                    dst_layers=self.data_refs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+                transfer_kv_direct(
+                    src_layers=device_pool.kv_scale_buffer,
+                    dst_layers=self.scale_data_refs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            elif self.layout == "page_first_direct":
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=device_pool.kv_buffer,
+                    dst_ptrs=[self.kv_buffer],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+                transfer_kv_all_layer_direct_lf_pf(
+                    src_ptrs=device_pool.kv_scale_buffer,
+                    dst_ptrs=[self.kv_scale_buffer],
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
         else:
-            transfer_kv_direct(
-                src_layers=device_pool.index_k_with_scale_buffer,
-                dst_layers=self.index_k_with_scale_buffer,
-                src_indices=device_page_indices,
-                dst_indices=host_page_indices,
-                page_size=1,
-            )
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    # ------------------------------------------------------------------
+    # Host -> Device (reload / prefetch)
+    # ------------------------------------------------------------------
 
     def load_to_device_per_layer(
         self,
@@ -1169,20 +1251,240 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         device_indices,
         layer_id,
         io_backend,
-    ):
-        super().load_to_device_per_layer(
-            device_pool, host_indices, device_indices, layer_id, io_backend
-        )
-        self._load_indexer_to_device_per_layer(
-            device_pool, host_indices, device_indices, layer_id, io_backend
-        )
+    ) -> None:
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                transfer_kv_per_layer_mla(
+                    src=self.kv_buffer[layer_id],
+                    dst=device_pool.kv_buffer[layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    item_size=self.token_stride_size,
+                )
+                transfer_kv_per_layer_mla(
+                    src=self.kv_scale_buffer[layer_id],
+                    dst=device_pool.kv_scale_buffer[layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    item_size=self.scale_stride_size,
+                )
+            elif self.layout == "page_first":
+                transfer_kv_per_layer_mla_pf_lf(
+                    src=self.kv_buffer,
+                    dst=device_pool.kv_buffer[layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    item_size=self.token_stride_size,
+                    src_layout_dim=self.layout_dim,
+                )
+                transfer_kv_per_layer_mla_pf_lf(
+                    src=self.kv_scale_buffer,
+                    dst=device_pool.kv_scale_buffer[layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    item_size=self.scale_stride_size,
+                    src_layout_dim=self.scale_layout_dim,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            if self.layout == "layer_first":
+                transfer_kv_direct(
+                    src_layers=[self.kv_buffer[layer_id]],
+                    dst_layers=[device_pool.kv_buffer[layer_id]],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    page_size=self.page_size,
+                )
+                transfer_kv_direct(
+                    src_layers=[self.kv_scale_buffer[layer_id]],
+                    dst_layers=[device_pool.kv_scale_buffer[layer_id]],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    page_size=self.page_size,
+                )
+            elif self.layout == "page_first_direct":
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[self.kv_buffer],
+                    dst_ptrs=[device_pool.kv_buffer[layer_id]],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    page_size=self.page_size,
+                )
+                transfer_kv_per_layer_direct_pf_lf(
+                    src_ptrs=[self.kv_scale_buffer],
+                    dst_ptrs=[device_pool.kv_scale_buffer[layer_id]],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    page_size=self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
-    ):
-        super().backup_from_device_all_layer(
-            device_pool, host_indices, device_indices, io_backend
+    # ------------------------------------------------------------------
+    # Data page helpers (used by storage backends)
+    # ------------------------------------------------------------------
+
+    def get_data_page(self, index: int, flat: bool = True) -> torch.Tensor:
+        if self.layout == "layer_first":
+            kv_page = self.kv_buffer[:, index : index + self.page_size, :, :]
+            scale_page = self.kv_scale_buffer[
+                :, index : index + self.page_size, :
+            ]
+        elif self.layout == "page_first":
+            kv_page = self.kv_buffer[index : index + self.page_size, :, :, :]
+            scale_page = self.kv_scale_buffer[
+                index : index + self.page_size, :, :
+            ]
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            kv_page = self.kv_buffer[
+                real_index : real_index + 1, :, :, :, :
+            ]
+            scale_page = self.kv_scale_buffer[
+                real_index : real_index + 1, :, :, :
+            ]
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        if flat:
+            return torch.cat([kv_page.flatten(), scale_page.flatten()])
+        return kv_page
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        kv_dummy = torch.zeros(
+            (self.layer_num, self.page_size, 1, self.fp4_packed_dim),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
         )
-        self._backup_indexer_from_device_all_layer(
-            device_pool, host_indices, device_indices, io_backend
+        scale_dummy = torch.zeros(
+            (self.layer_num, self.page_size, self.scale_dim),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
         )
+        return torch.cat([kv_dummy.flatten(), scale_dummy.flatten()])
+
+    def set_from_flat_data_page(
+        self, index: int, data_page: torch.Tensor
+    ) -> None:
+        kv_numel = self.layer_num * self.page_size * 1 * self.fp4_packed_dim
+        kv_data = data_page[:kv_numel]
+        scale_data = data_page[kv_numel:]
+
+        if self.layout == "layer_first":
+            self.kv_buffer[
+                :, index : index + self.page_size, :, :
+            ] = kv_data.reshape(
+                self.layer_num, self.page_size, 1, self.fp4_packed_dim
+            )
+            self.kv_scale_buffer[
+                :, index : index + self.page_size, :
+            ] = scale_data.reshape(
+                self.layer_num, self.page_size, self.scale_dim
+            )
+        elif self.layout == "page_first":
+            self.kv_buffer[
+                index : index + self.page_size, :, :, :
+            ] = kv_data.reshape(
+                self.page_size, self.layer_num, 1, self.fp4_packed_dim
+            )
+            self.kv_scale_buffer[
+                index : index + self.page_size, :, :
+            ] = scale_data.reshape(
+                self.page_size, self.layer_num, self.scale_dim
+            )
+        elif self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            self.kv_buffer[
+                real_index : real_index + 1, :, :, :, :
+            ] = kv_data.reshape(
+                1, self.layer_num, self.page_size, 1, self.fp4_packed_dim
+            )
+            self.kv_scale_buffer[
+                real_index : real_index + 1, :, :, :
+            ] = scale_data.reshape(
+                1, self.layer_num, self.page_size, self.scale_dim
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+    # ------------------------------------------------------------------
+    # Zero-copy metadata (for Mooncake storage)
+    # ------------------------------------------------------------------
+
+    def get_page_buffer_meta(self, indices):
+        assert len(indices) % self.page_size == 0
+        ptr_list = []
+        kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+        scale_buffer_data_ptr = self.kv_scale_buffer.data_ptr()
+        indices_list = indices.tolist()
+
+        if self.layout == "layer_first":
+            for index in range(0, len(indices_list), self.page_size):
+                for layer_id in range(self.layer_num):
+                    k_ptr = (
+                        kv_buffer_data_ptr
+                        + indices_list[index] * self.fp4_packed_dim
+                        + layer_id * self.size * self.fp4_packed_dim
+                    )
+                    ptr_list.append(k_ptr)
+            element_size = self.page_size * self.fp4_packed_dim
+            element_size_list = [element_size] * len(ptr_list)
+
+            # Append scale buffer metadata
+            scale_ptr_list = []
+            for index in range(0, len(indices_list), self.page_size):
+                for layer_id in range(self.layer_num):
+                    s_ptr = (
+                        scale_buffer_data_ptr
+                        + indices_list[index] * self.scale_dim
+                        + layer_id * self.size * self.scale_dim
+                    )
+                    scale_ptr_list.append(s_ptr)
+            scale_element_size = self.page_size * self.scale_dim
+            ptr_list.extend(scale_ptr_list)
+            element_size_list.extend(
+                [scale_element_size] * len(scale_ptr_list)
+            )
+
+        elif self.layout in ["page_first", "page_first_direct"]:
+            for index in range(0, len(indices_list), self.page_size):
+                k_ptr = (
+                    kv_buffer_data_ptr
+                    + indices_list[index]
+                    * self.layer_num
+                    * self.fp4_packed_dim
+                )
+                ptr_list.append(k_ptr)
+            element_size = (
+                self.layer_num * self.page_size * self.fp4_packed_dim
+            )
+            element_size_list = [element_size] * len(ptr_list)
+
+            scale_ptr_list = []
+            for index in range(0, len(indices_list), self.page_size):
+                s_ptr = (
+                    scale_buffer_data_ptr
+                    + indices_list[index]
+                    * self.layer_num
+                    * self.scale_dim
+                )
+                scale_ptr_list.append(s_ptr)
+            scale_element_size = (
+                self.layer_num * self.page_size * self.scale_dim
+            )
+            ptr_list.extend(scale_ptr_list)
+            element_size_list.extend(
+                [scale_element_size] * len(scale_ptr_list)
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+        return ptr_list, element_size_list
