@@ -104,6 +104,8 @@ class LogitsProcessorOutput:
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
 
+    mm_input_embeds: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -145,6 +147,8 @@ class LogitsMetadata:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    mm_input_embeds: Optional[torch.Tensor] = None
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -196,6 +200,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
+            mm_input_embeds=forward_batch.mm_input_embeds,
         )
 
     def compute_dp_attention_metadata(self):
@@ -242,6 +247,7 @@ class LogitsProcessor(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
@@ -948,7 +954,7 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
             assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits[:, : self.config.vocab_size])
+            logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer
         else:
             logits = logits[:, : self.config.vocab_size].float()

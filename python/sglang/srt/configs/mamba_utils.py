@@ -22,6 +22,8 @@ import torch
 
 from sglang.srt.distributed.utils import divide
 
+logger = logging.getLogger(__name__)
+
 
 def extra_groups_for_head_shards(ngroups: int, tp_size: int):
     """Compute the increase in group numbers to account for
@@ -55,7 +57,7 @@ def mamba2_state_dtype() -> Mamba2StateDType:
 
 @dataclass(kw_only=True, frozen=True)
 class BaseLinearStateParams(ABC):
-    dtype: Mamba2StateDType = field(default_factory=mamba2_state_dtype)
+    dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
     layers: list[int]
 
     @property

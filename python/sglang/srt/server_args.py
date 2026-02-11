@@ -494,7 +494,7 @@ class ServerArgs:
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
-    mamba_ssm_dtype: str = "float32"
+    mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
@@ -609,7 +609,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
-    nsa_prefill_cp_mode: str = "in-seq-split"
+    nsa_prefill_cp_mode: str = "round-robin-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
 
@@ -1105,9 +1105,15 @@ class ServerArgs:
             "DeepseekV3ForCausalLM",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
+            "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2
+            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2, GlmMoeDsaForCausalLM
+                if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
+                    envs.SGLANG_NSA_FORCE_MLA.set(True)
+                    logger.warning(
+                        "Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on SM100."
+                    )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
@@ -1484,7 +1490,11 @@ class ServerArgs:
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for "
                         f"{model_arch}"
                     )
-        elif model_arch in ["Qwen3NextForCausalLM"]:
+        elif model_arch in [
+            "Qwen3NextForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+        ]:
             if is_sm100_supported():
                 quant_method = get_quantization_config(hf_config)
                 if self.quantization is None and quant_method is not None:
@@ -1499,7 +1509,7 @@ class ServerArgs:
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
+                        f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
                     )
                 if self.attention_backend is None:
                     self.attention_backend = "triton"
@@ -2178,6 +2188,7 @@ class ServerArgs:
                 "DeepseekV3ForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
+                "GlmMoeDsaForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
                 "MistralLarge3ForCausalLM",
@@ -2459,6 +2470,7 @@ class ServerArgs:
                         "DeepseekV32ForCausalLM",
                         "MistralLarge3ForCausalLM",
                         "PixtralForConditionalGeneration",
+                        "GlmMoeDsaForCausalLM",
                     ]
                 except Exception:
                     pass
@@ -2556,6 +2568,24 @@ class ServerArgs:
                 "Pipeline parallelism is disabled because of using diffusion LLM inference"
             )
             self.pp_size = 1
+
+        if self.enable_lora:
+            logger.warning(
+                "Currently LoRA is not supported by diffusion LLM inference."
+            )
+            self.enable_lora = False
+
+        if self.disaggregation_mode != "null":
+            logger.warning(
+                "Currently disaggregation is not supported by diffusion LLM inference."
+            )
+            self.disaggregation_mode = "null"
+
+        if self.enable_mixed_chunk:
+            logger.warning(
+                "Mixed chunked prefill is disabled because of using diffusion LLM inference."
+            )
+            self.enable_mixed_chunk = False
 
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
@@ -3901,9 +3931,10 @@ class ServerArgs:
         parser.add_argument(
             "--mamba-ssm-dtype",
             type=str,
-            default=ServerArgs.mamba_ssm_dtype,
+            default=None,
             choices=MAMBA_SSM_DTYPE_CHOICES,
-            help="The data type of the SSM states in mamba cache.",
+            help="The data type of the SSM states in mamba cache. "
+            "If not set, will be read from model config (mamba_ssm_dtype).",
         )
         parser.add_argument(
             "--mamba-full-memory-ratio",
@@ -4453,7 +4484,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.nsa_prefill_cp_mode,
             choices=NSA_PREFILL_CP_SPLIT_CHOICES,
-            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'in-seq-split' (default), 'round-robin-split'. "
+            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'round-robin-split'(default), 'in-seq-split'  "
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
         )
         parser.add_argument(
@@ -5449,6 +5480,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "GptOssForCausalLM",
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",

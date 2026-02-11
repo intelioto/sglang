@@ -286,4 +286,6 @@ class Qwen3NextConfig(PretrainedConfig):
             conv_kernel=self.linear_conv_kernel_dim,
         )
 
-        return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
+        return Mamba2CacheParams(
+            shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
+        )

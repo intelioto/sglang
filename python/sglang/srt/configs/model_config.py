@@ -61,6 +61,7 @@ def is_deepseek_nsa(config: PretrainedConfig) -> bool:
             "DeepseekV3ForCausalLMNextN",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
+            "GlmMoeDsaForCausalLM",
         ]
         and getattr(config, "index_topk", None) is not None
     )
@@ -266,10 +267,10 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
-        ):
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "DeepseekV3ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+        ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] in [
@@ -385,6 +386,7 @@ class ModelConfig:
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
+            or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
@@ -424,7 +426,6 @@ class ModelConfig:
                     scaling_factor = self.hf_config.rope_scaling["factor"]
                     mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                     self.scaling = self.scaling * mscale * mscale
-
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -1115,6 +1116,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
+        or "Gemma2ForSequenceClassification" in model_architectures
     ):
         return False
     else:
@@ -1149,6 +1151,8 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",

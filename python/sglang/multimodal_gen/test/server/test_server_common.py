@@ -89,6 +89,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.enable_warmup:
         extra_args += f" --enable-warmup"
 
+    for arg in server_args.extras:
+        extra_args += f" {arg}"
+
     # Build custom environment variables
     env_vars = {}
     if server_args.enable_cache_dit:

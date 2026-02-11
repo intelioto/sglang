@@ -3,8 +3,10 @@ import logging
 import pickle
 import random
 import threading
+import time
 import uuid
 from enum import IntEnum
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
 import aiohttp
@@ -103,6 +105,7 @@ class WaitingImageRequestStatus(IntEnum):
     FAIL = -1
     PENDING = 0
     SUCCESS = 1
+    TIMEOUT = -2
 
 
 # For zmq_to_scheduler
@@ -135,6 +138,7 @@ class WaitingImageRequest:
         self.status = WaitingImageRequestStatus.PENDING
         self.error_msg = None
         self.error_code = None
+        self.start_time = time.time()
 
     def send_encode_request(self):
         async def _send_single_request(session, url, payload):
@@ -275,6 +279,7 @@ class MMReceiver:
             self.hostname = get_local_ip_auto()
             self.waiting_list: List[WaitingImageRequest] = []
             self.scheduler = scheduler
+            self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
             if hf_config is not None:
                 transport_mode = _determine_tensor_transport_mode(server_args)
                 import_processors("sglang.srt.multimodal.processors")
@@ -365,9 +370,12 @@ class MMReceiver:
         if len(self.waiting_list) == 0:
             return new_recv_reqs, []
 
+        current_time = time.time()
         local_status = []
         for waiting_req in self.waiting_list:
             waiting_req._try_recv_mm_data()
+            if current_time - waiting_req.start_time > self.wait_timeout:
+                waiting_req.status = WaitingImageRequestStatus.TIMEOUT
             local_status.append(waiting_req.status)
 
         local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
@@ -393,6 +401,17 @@ class MMReceiver:
                         self.create_req(waiting_req.recv_req),
                         waiting_req.error_msg,
                         waiting_req.error_code,
+                    )
+                )
+            elif status_value == WaitingImageRequestStatus.TIMEOUT:
+                logger.error(
+                    f"Timed out waiting for image embeddings for request {waiting_req.rid}"
+                )
+                abort_reqs.append(
+                    (
+                        self.create_req(waiting_req.recv_req),
+                        f"Timeout waiting for image embedding after {self.wait_timeout}s",
+                        HTTPStatus.REQUEST_TIMEOUT,
                     )
                 )
             else:  # status_value == WaitingImageRequestStatus.PENDING
